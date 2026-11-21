@@ -306,6 +306,51 @@ def land(m, path, at, col, clause):
     return None
 
 
+def header_change(m, path, removed, added):
+    """Line-for-line edits inside function headers that run at load. An edit inside an annotation costs nothing
+    (the map lists annotation spans only for modules with `from __future__ import annotations`, where they stay
+    strings nothing evaluates); an edit inside a literal default that leaves a literal costs the function's
+    callers. None for anything else (the caller prices it as before)."""
+    rows = m.d["files"][path].get("hdr")
+    if not rows or not removed or len(removed) != len(added):
+        return None
+    sel = 0
+    for (x, old), new in zip(removed, added):
+        if old == new:
+            continue
+        row = next((r for r in rows if r[0] <= x <= r[1]), None)
+        if row is None:
+            return None
+        n = min(len(old), len(new))
+        a = 0
+        while a < n and old[a] == new[a]:
+            a += 1
+        q = 0
+        while q < n - a and old[-1 - q] == new[-1 - q]:
+            q += 1
+        b = len(old) - q  # old[a:b] became new[a:len(new) - q]
+
+        def inside(spans):
+            for l0, c0, l1, c1 in spans:
+                lo, hi = (c0 if x == l0 else 0), (c1 if x == l1 else len(old))
+                if l0 <= x <= l1 and lo <= a and b <= hi:
+                    return l0, lo, l1, hi
+            return None
+
+        if inside(row[3]) is not None:
+            continue
+        got = inside(row[4])
+        if got is None or not got[0] == got[2] == x:
+            return None  # not in a default, or a default over several lines
+        lo, hi = got[1], got[3]
+        try:
+            ast.literal_eval(new[lo:hi + len(new) - len(old)].strip())
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return None  # no longer a literal: evaluating it at load may fail
+        sel |= m.set(row[2])
+    return sel
+
+
 def select_sqlglot(m, path, blocks):
     info = m.d["files"][path]
     strings = m.spans(path, "str")
@@ -332,6 +377,10 @@ def select_sqlglot(m, path, blocks):
         if all(is_comment_or_blank(t) for t in texts) and not in_string:
             continue
         if same_everywhere(m, path, removed, added):
+            continue
+        got = header_change(m, path, removed, added)
+        if got is not None:
+            sel |= got  # 0 when only annotations changed
             continue
         # Removed lines: each changes or deletes the statement it belongs to.
         for x, t in removed:
@@ -396,21 +445,86 @@ def select_testfile(m, path, blocks):
     return sel
 
 
+def inert_module(blocks):
+    """True when a new module's code, run at import, only binds names: imports, defs, classes whose bodies only do
+    the same, plain assignments, docstrings and a __main__ guard. Loading such a test module cannot change how
+    other tests run, and its own tests are not in the list."""
+    try:
+        tree = ast.parse("\n".join(t for b in blocks for t in b[1]))
+    except (SyntaxError, ValueError):
+        return False
+
+    def plain_value(v):
+        if isinstance(v, (ast.Name, ast.Attribute)):
+            return True
+        try:
+            ast.literal_eval(v)
+            return True
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return False
+
+    def plain(s, in_class):
+        if isinstance(s, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.Pass)):
+            return True
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
+            return True
+        if isinstance(s, ast.Assign) or (isinstance(s, ast.AnnAssign) and s.value is not None):
+            return plain_value(s.value)
+        if isinstance(s, ast.ClassDef):
+            return all(isinstance(b, (ast.Name, ast.Attribute)) for b in s.bases) and \
+                all(plain(x, True) for x in s.body)
+        if not in_class and isinstance(s, ast.If) and isinstance(s.test, ast.Compare) and \
+                isinstance(s.test.left, ast.Name) and s.test.left.id == "__name__":
+            return True
+        return False
+
+    return all(plain(s, False) for s in tree.body)
+
+
+def folder_readers(m, path):
+    """Tests that read some file in the folder of `path`: they may list the folder (test_typing imports every
+    module in sqlglot/typing; fixture loaders read whole folders), so a file added or removed there reaches them."""
+    folder = path.rsplit("/", 1)[0] + "/"
+    sel = 0
+    for k, sid in m.d["opens"].items():
+        if k.startswith(folder):
+            sel |= m.set(sid)
+    return sel
+
+
 def select(m, patch_text):
     sel = 0
     for old, new, blocks in parse_patch(patch_text):
         path = old or new
         if not path:
             continue
-        if path in CONFIG_FILES:
+        paths = {old, new} - {None, ""}
+        # Config, and any .py file at the root: the root is on sys.path in the test run, so a new json.py there
+        # would shadow the standard library for every test.
+        if any(p in CONFIG_FILES or ("/" not in p and p.endswith(".py")) for p in paths):
             return m.all_tests()
+        if any(p.rsplit("/", 1)[-1] == "conftest.py" for p in paths):
+            # A conftest below the root applies to every test under its folder.
+            for p in paths:
+                folder = p.rsplit("/", 1)[0] + "/"
+                for f, sid in m.d["file_tests"].items():
+                    if f.startswith(folder):
+                        sel |= m.set(sid)
+            continue
         # Tests that read the file as data (source parsed as text, fixtures, setup scripts).
-        for p in {old, new} - {None}:
+        for p in paths:
             if p in m.d["opens"]:
                 sel |= m.set(m.d["opens"][p])
         if path.startswith("sqlglot/") and path.endswith(".py"):
+            if old is None or new is None or new != old:
+                for p in paths:
+                    sel |= folder_readers(m, p)
             if old is None:
-                continue  # a new module runs only where a changed module imports it
+                # A new module runs only where a changed module imports it, or a test lists its folder, or it is
+                # a package that now shadows the module of the same name.
+                if path.endswith("/__init__.py") and path[: -len("/__init__.py")] + ".py" in m.d["files"]:
+                    sel |= m.set(m.d["files"][path[: -len("/__init__.py")] + ".py"]["importers"])
+                continue
             if path not in m.d["files"]:
                 return m.all_tests()
             if new is None or (new and new != old):
@@ -420,15 +534,14 @@ def select(m, patch_text):
         elif path.startswith("tests/") and path.endswith(".py") and path in m.d["testfiles"] and old is not None:
             sel |= select_testfile(m, path, blocks)
         elif path.startswith("tests/"):
+            if old is None and path.endswith(".py") and not path.endswith("/__init__.py") and inert_module(blocks):
+                continue  # a new test module that only defines things (its tests are not in the list)
             if old is not None and path in m.d["opens"]:
                 sel |= m.set(m.d["opens"][path])
             if old is None or new is None or (new and new != old):
                 # A file added, removed or renamed in a folder some test reads: those tests may list the folder.
-                for p in {path, new} - {None}:
-                    folder = p.rsplit("/", 1)[0] + "/"
-                    for k, sid in m.d["opens"].items():
-                        if k.startswith(folder):
-                            sel |= m.set(sid)
+                for p in paths:
+                    sel |= folder_readers(m, p)
         elif path.startswith("sqlglot/"):
             return m.all_tests()
     return sel
