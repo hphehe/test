@@ -17,8 +17,7 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).with_name("map.json.gz")))
 WORKER_MS = 2000
 MAX_WORKERS = 8
-# Probe: a commit whose selection would cost more than this runs nothing (measures what those commits cost us).
-PROBE_MAX_MS = 30000
+# Probe notpcds: test_executor::test_execute_tpcds is never run (the rest is repacked).
 # Files whose change can alter how pytest runs every test.
 CONFIG_FILES = {"setup.cfg", "pyproject.toml", "setup.py", "conftest.py", "tests/conftest.py", "pytest.ini", "tox.ini"}
 # A line opening one of these clauses extends the statement before it rather than starting a new one.
@@ -665,10 +664,9 @@ def main():
             print(f"{patch.stem}: {exc!r}", file=sys.stderr)
             mask = m.all_tests()
         chosen = [n for n in ms if mask >> n & 1]
-        workers = pack(chosen, ms)
-        if workers and max(sum(ms[t] for t in w) for w in workers) + WORKER_MS * len(workers) > PROBE_MAX_MS:
-            workers = []
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
+        tpcds = {t["number"] for t in tests if t["id"] == "tests/test_executor.py::TestExecutor::test_execute_tpcds"}
+        chosen = [n for n in chosen if n not in tpcds]
+        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}))
 
 
 if __name__ == "__main__":
