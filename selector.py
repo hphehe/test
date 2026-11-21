@@ -2024,6 +2024,12 @@ SETUP_WALL_S = 12.0  # wall seconds between tests (imports, class fixtures)
 NO_RUN_FILES = ("tests/test_dialect_entry_points.py", "tests/test_sqlglotc.py")
 NO_RUN_IDS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}  # runs python in a subprocess
 RUN_DEBUG = os.environ.get("BR_RUN_DEBUG")
+MATE_P = 0.6  # share of commits with test_execute_tpcds a candidate where no classmate fails (gen2k: ~0.7)
+MATE_CHEAP_S = 2.0  # classmates that run first, ahead of the budget's order
+MANY_FAILURES = 8  # with this many failing tests, test_execute_tpcds stays whatever its classmates did
+MATE_LONG_MS = 15000  # classmates are tests recorded at most this long
+MATE_OFF_FILES = ("tests/test_executor.py",)  # the test's own code: its classmates say nothing about it
+MATE_OFF_DIRS = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")
 CO_OPTIMIZED = 0x1
 
 
@@ -2582,10 +2588,15 @@ def sim_cost(ts, ms):
     return (max(sum(ms[t] for t in x) for x in w) + WORKER_MS * len(w)) / 1000
 
 
-def run_choice(m, plan, cands, tests, ms, info):
-    """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate), or None
-    when the runs cannot save more than they cost."""
+def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
+    """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate, classmates
+    of test_execute_tpcds run here), or None when the runs cannot save more than they cost."""
     cpu, cls_cpu, bad = info.get("cpu", {}), info.get("cls", {}), set(info.get("bad", ()))
+    if not any(p.endswith(".py") for p in plan["files"]):
+        # Only test data changed: the candidates are the readers of the changed entries, which then compare against
+        # changed expectations or inputs. Such a run nearly always ends in the failure it was sure to find (8 of 8 on
+        # the samples): it would change nothing in the answer and only cost CPU.
+        return None
     readers = 0
     for p in plan["files"]:
         # .py files are read through open(), io.open (pathlib) or the import system, all served the patched text
@@ -2598,35 +2609,51 @@ def run_choice(m, plan, cands, tests, ms, info):
         c = cpu.get(tests[n]["id"])
         return c if c is not None else 1.5 * ms[n] / 1000 + 0.01
 
-    run = []
-    for n in cands:
-        tid, rec = tests[n]["id"], ms[n] / 1000
-        if (tid in bad or tid in NO_RUN_IDS or tid.startswith(NO_RUN_FILES) or tid.count("::") != 2
-                or rec > LONG_S or readers >> n & 1):
-            continue
-        if cost(n) <= max(HOLD_FLOOR_S, HOLD_FACTOR * (WORKER_MS / 1000 + rec)):
-            run.append(n)
+    def runnable(n):
+        tid = tests[n]["id"]
+        return not (tid in bad or tid in NO_RUN_IDS or tid.startswith(NO_RUN_FILES) or tid.count("::") != 2
+                    or ms[n] / 1000 > LONG_S or readers >> n & 1)
+
+    def spend_of(ts):
+        classes = {tests[n]["id"].rsplit("::", 1)[0] for n in ts}
+        x = sum(cost(n) for n in ts) + sum(cls_cpu.get(c, 0.0) for c in classes)
+        return x + (info.get("imp", FRESH_IMPORT_S) if plan["mode"] == "fresh" else 0.02)
+
+    tp_on = (tp in cands and bool(mates_all)
+             and not any(p in MATE_OFF_FILES or p.startswith(MATE_OFF_DIRS) for p in plan["files"]))
+    # Classmates of test_execute_tpcds (the other TestExecutor tests, the readers of the TPC query files) that are
+    # cheap run first: test_execute_tpcds is left out unless one of the classmates that ran fails (see runner_phase).
+    protect = {n for n in cands if tp_on and mates_all >> n & 1 and runnable(n) and cost(n) <= MATE_CHEAP_S}
+    run = [n for n in cands if runnable(n) and (n in protect or
+                                                cost(n) <= max(HOLD_FLOOR_S, HOLD_FACTOR * (WORKER_MS / 1000 + ms[n] / 1000)))]
     budget = HOT_BUDGET_S if plan["mode"] == "hot" else FRESH_BUDGET_S
-    if sum(cost(n) for n in run) > budget:
+    if sum(cost(n) for n in run if n not in protect) > budget:
         keep, acc = set(), 0.0
         for n in sorted(run, key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002)):
-            if acc + cost(n) <= budget:
+            if n not in protect and acc + cost(n) <= budget:
                 acc += cost(n)
                 keep.add(n)
-        run = [n for n in run if n in keep]
+        run = [n for n in run if n in keep or n in protect]
     if not run:
         return None
-    classes = {tests[n]["id"].rsplit("::", 1)[0] for n in run}
-    spend = sum(cost(n) for n in run) + sum(cls_cpu.get(c, 0.0) for c in classes)
-    spend += info.get("imp", FRESH_IMPORT_S) if plan["mode"] == "fresh" else 0.02
+    full = sim_cost(cands, ms)
     rest = [n for n in cands if n not in set(run)]
-    if sim_cost(cands, ms) - sim_cost(rest, ms) <= spend:
+    gain = full - sim_cost(rest, ms)
+    mates = sorted(protect)
+    if mates:
+        gain = MATE_P * (full - sim_cost([n for n in rest if n != tp], ms)) + (1 - MATE_P) * gain
+    spend = spend_of(run)
+    if gain <= spend:
         return None  # even if every run passes, the answer shrinks by less than the runs cost
-    run.sort()
     skip_after = {n for n in run if cost(n) > max(0.03, AFTER_FAIL * ms[n] / 1000)}
+    first = {}
+    for n in sorted(run):
+        first.setdefault(tests[n]["id"].rsplit("::", 1)[0], n)
+    # One class after another (class fixtures run once); in a class, the tests a failure would skip come last.
+    run.sort(key=lambda n: (first[tests[n]["id"].rsplit("::", 1)[0]], n in skip_after, n))
     allowed = {n: max(TEST_WALL_S, 25 * cost(n)) for n in run}
     cap = 2.0 + 3.0 * spend + max(allowed.values())
-    return run, skip_after, allowed, cap, spend
+    return run, skip_after, allowed, cap, spend, mates
 
 
 def expected_callers(m, plan):
@@ -2647,24 +2674,43 @@ def expected_callers(m, plan):
     return exp_mask
 
 
-def runner_phase(m, tests, ms, work, t_start):
-    """work: [(commit, candidates, patch text)]. Returns {commit: tests that passed here}."""
+def tpcds_mates(m, tests, ms, tp):
+    """Bit mask of test_execute_tpcds's classmates: the other TestExecutor tests and the tests that read a TPC query
+    file, recorded at most MATE_LONG_MS."""
+    if tp is None:
+        return 0
+    readers = 0
+    for p, sid in m.d["opens"].items():
+        if p.startswith(MATE_OFF_DIRS):
+            readers |= m.set(sid)
+    mask = 0
+    for n, t in tests.items():
+        if n != tp and ms[n] <= MATE_LONG_MS and (t["id"].startswith("tests/test_executor.py::TestExecutor::")
+                                                  or readers >> n & 1):
+            mask |= 1 << n
+    return mask
+
+
+def runner_phase(m, tests, ms, work, t_start, tp=None):
+    """work: [(commit, candidates, patch text)]. Returns ({commit: tests that passed here}, {commits whose
+    test_execute_tpcds classmates all passed here})."""
     import gc
     info = m.d.get("run") or {}
     if not os.path.isdir(os.path.join(ST, "sqlglot")) or not hasattr(os, "fork") or not info.get("cpu"):
-        return {}
+        return {}, set()
+    mates_all = tpcds_mates(m, tests, ms, tp)
     jobs = []
     for c, cands, text in work:
         try:
             plan = run_plan(m, text)
-            ch = run_choice(m, plan, cands, tests, ms, info) if plan else None
+            ch = run_choice(m, plan, cands, tests, ms, info, tp, mates_all) if plan else None
         except Exception as exc:  # noqa: BLE001
             _log(c, "plan:", repr(exc))
             continue
         if ch is not None:
             jobs.append([c, cands, plan, ch])
     if not jobs:
-        return {}
+        return {}, set()
     for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         os.environ.setdefault(k, "1")
     os.chdir(ST)
@@ -2712,13 +2758,13 @@ def runner_phase(m, tests, ms, work, t_start):
         if plan["mode"] == "hot" and (j[0] in hit or any(os.path.join(ST, p) in opened for p in plan["files"]
                                                          if not p.endswith(".py"))):
             plan["mode"], plan["pairs"] = "fresh", []
-            j[3] = run_choice(m, plan, j[1], tests, ms, info)
+            j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     gc.freeze()
-    out = {}
+    out, tp_ok = {}, set()
     jobs.sort(key=lambda j: j[3][4])
-    for c, cands, plan, (run, skip_after, allowed, cap, spend) in jobs:
+    for c, cands, plan, (run, skip_after, allowed, cap, spend, mates) in jobs:
         left = t_start + RUN_DEADLINE_S - time.monotonic()
         if left < 5.0:
             break
@@ -2737,9 +2783,18 @@ def runner_phase(m, tests, ms, work, t_start):
         passed = {n for n, (code, reached, _) in verdicts.items()
                   if code == 0 and (reached or not exp_mask >> n & 1)}
         out[c] = passed
+        failing = [n for n, v in verdicts.items() if v[0] == 1]
+        # test_execute_tpcds stays when a classmate that ran fails, when a classmate's pass is not trusted (a hot
+        # run that never reached the changed code it was expected to reach), or when many tests fail. On 106
+        # labelled commits that select it, every one of the 13 where it fails also fails a cheap classmate.
+        if (mates and status == "END" and all(n in verdicts for n in run) and len(failing) < MANY_FAILURES
+                and not any(mates_all >> n & 1 for n in failing) and any(n in passed for n in mates)
+                and not any(mates_all >> n & 1 and v[0] == 0 and n not in passed for n, v in verdicts.items())):
+            tp_ok.add(c)
         _log(f"{c} {plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} pass {len(passed)} "
-             f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}")
-    return out
+             f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}"
+             + (f" mates {len(mates)} {'drop tpcds' if c in tp_ok else 'keep tpcds'}" if mates else ""))
+    return out, tp_ok
 
 
 def measure_main(out_path):
@@ -2901,24 +2956,27 @@ def select_all(t_start):
             if job is not None:
                 jobs[patch.stem] = job
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
+    out = {stem: chosen for stem, chosen, _ in rows}
     try:
-        dropped = run_checks(jobs, t0)
+        passed, tp_ok = runner_phase(m, {t["number"]: t for t in tests}, ms,
+                                     [(stem, out[stem], text) for stem, _, text in rows if out[stem]], t_start, tp)
+    except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
+        print(f"runner: {exc!r}", file=sys.stderr)
+        passed, tp_ok = {}, set()
+    _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
+    for stem, ok in passed.items():
+        out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
+    # The proof checks only where the runs left test_execute_tpcds in
+    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ())}
+    try:
+        dropped = run_checks(jobs, time.time())
     except Exception as exc:  # noqa: BLE001
         print(f"tpcds checks: {exc!r}", file=sys.stderr)
         dropped = {}
-    _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU")
-    out = {}
-    for stem, chosen, _ in rows:
-        out[stem] = [n for n in chosen if n != tp] if dropped.get(stem) else chosen
-    try:
-        passed = runner_phase(m, {t["number"]: t for t in tests}, ms,
-                              [(stem, out[stem], text) for stem, _, text in rows if out[stem]], t_start)
-    except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
-        print(f"runner: {exc!r}", file=sys.stderr)
-        passed = {}
-    _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU")
-    for stem, ok in passed.items():
-        out[stem] = [n for n in out[stem] if n not in ok]
+    _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
+    for stem, ok in dropped.items():
+        if ok:
+            out[stem] = [n for n in out[stem] if n != tp]
     return [stem for stem, _, _ in rows], out
 
 
