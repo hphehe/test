@@ -1254,7 +1254,7 @@ def skey(k):
 TABLE_TYPES = (dict, set, frozenset)
 
 
-def snap_state(root, bag_keys=()):
+def snap_state(root, bag_keys=(), want_ents=None):
     """Child process: import every sqlglot module from root with unittest loaded (sqlglot's UNITTEST flag, as under
     pytest) and fingerprint the state. ({key: [hash, tag, module, qualname]}, {key: bag hash}, stats)."""
     import enum
@@ -1392,7 +1392,8 @@ def snap_state(root, bag_keys=()):
         keys[key] = [h(fp(value, 0, frozenset(), False)), t, mod, qual]
         if key in bag_keys:
             bags[key] = h(fp(value, 0, frozenset(), True))
-        if type(value) in TABLE_TYPES:
+        if type(value) in TABLE_TYPES and want_ents is not None and \
+                (want_ents is True or want_ents(key, keys[key][0], bags.get(key))):
             # Entry by entry, so that a diff can name the keys that changed (values order-free where the holder's
             # value differs from run to run).
             per, order = {}, []
@@ -1456,14 +1457,14 @@ def snap_env():
             "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
 
 
-def snap_run(root, out, bag_keys=(), pad=0):
+def snap_run(root, out, bag_keys=(), pad=0, ents=False):
     """One full snapshot of root in a fresh process, written to out. pad shifts the process's memory layout (the
     order of sets of classes follows their addresses)."""
     with open(out + ".bag", "w") as fh:
         json.dump(sorted(bag_keys), fh)
     env = dict(snap_env(), BR_SNAP_PAD=str(pad))
-    subprocess.run([sys.executable, "-s", "-P", os.path.abspath(__file__), "--snap", root, out, out + ".bag"],
-                   env=env, check=True, cwd="/tmp", stdout=subprocess.DEVNULL)
+    subprocess.run([sys.executable, "-s", "-P", os.path.abspath(__file__), "--snap", root, out, out + ".bag"]
+                   + (["ents"] if ents else []), env=env, check=True, cwd="/tmp", stdout=subprocess.DEVNULL)
     with open(out) as fh:
         return json.load(fh)
 
@@ -1476,19 +1477,20 @@ def build_state_base(root, dest):
     tmp = tempfile.mkdtemp(prefix="sd")
     rng = random.Random(20261122)
 
-    def run(i, bag_keys=()):
+    def run(i, bag_keys=(), ents=False):
         copy_root = os.path.join(tmp, "t" * (1 + rng.randrange(40)) + str(i))
         shutil.copytree(os.path.join(root, "sqlglot"), os.path.join(copy_root, "sqlglot"))
         try:
-            return snap_run(copy_root, os.path.join(tmp, f"s{i}.json"), bag_keys, pad=rng.randrange(0, 200000))
+            return snap_run(copy_root, os.path.join(tmp, f"s{i}.json"), bag_keys, pad=rng.randrange(0, 200000),
+                            ents=ents)
         finally:
             shutil.rmtree(copy_root, ignore_errors=True)
     try:
         runs = [run(i) for i in range(8)]
         base = runs[0]["keys"]
         unstable = sorted({k for r in runs[1:] for k in set(base) | set(r["keys"]) if r["keys"].get(k) != base.get(k)})
-        b1 = run(8, unstable)
-        b2 = run(9, unstable)
+        b1 = run(8, unstable, ents=True)
+        b2 = run(9, unstable, ents=True)
         never = sorted(k for k in unstable if b1["bags"].get(k) != b2["bags"].get(k))
         if any(r["stats"]["deep"] for r in runs):
             raise RuntimeError(f"pinned state not comparable: {runs[0]['stats']}")
@@ -1498,9 +1500,12 @@ def build_state_base(root, dest):
         ent_never = sorted(k for k in ents if ents[k] != e2.get(k))
         for r in runs:
             r["stats"].pop("ents", None)
+        sd = {"keys": base, "unstable": unstable, "bags": b1["bags"], "never": never, "stats": runs[0]["stats"],
+              "ents": ents, "ent_never": ent_never}
         with open(dest, "w") as fh:
-            json.dump({"keys": base, "unstable": unstable, "bags": b1["bags"], "never": never,
-                       "stats": runs[0]["stats"], "ents": ents, "ent_never": ent_never}, fh)
+            json.dump(sd, fh)
+        with open(dest + ".pkl", "wb") as fh:  # the key check's fast read of the same base
+            pickle.dump(sd, fh, protocol=pickle.HIGHEST_PROTOCOL)
         print("state base:", len(base), "keys,", len(unstable), "unstable,", len(never), "never comparable,",
               len(ents), "tables,", len(ent_never), "tables not comparable by entry,", runs[0]["stats"])
     finally:
@@ -1508,13 +1513,13 @@ def build_state_base(root, dest):
 
 
 def snap_main(argv):
-    """--snap ROOT OUT BAGFILE: write one snapshot."""
-    root, out, bagfile = argv
+    """--snap ROOT OUT BAGFILE [ents]: write one snapshot (with every table's entry prints when "ents")."""
+    root, out, bagfile = argv[:3]
     with open(bagfile) as fh:
         bag_keys = json.load(fh)
     pad = int(os.environ.get("BR_SNAP_PAD", "0") or 0)
     ballast = [object() for _ in range(pad)], bytearray(pad * 7)  # noqa: F841  (shifts addresses; kept alive)
-    keys, bags, stats = snap_state(root, bag_keys)
+    keys, bags, stats = snap_state(root, bag_keys, True if argv[3:4] == ["ents"] else None)
     with open(out, "w") as fh:
         json.dump({"keys": keys, "bags": bags, "stats": stats}, fh)
     return 0
@@ -1548,37 +1553,49 @@ def state_diff(tmp):
     return diffs
 
 
-def state_key_diff(tmp):
-    """state_diff, plus for each changed dict / set holder the keys whose entries differ ("#n" when its size differs,
-    "#order" when its keys or their order do). (diffs, {holder: set of keys} or None for a holder that cannot be compared by entry), or
-    a string saying why the trees cannot be compared."""
-    if not os.path.isfile(SD):
-        return "no state base"
-    with open(SD) as fh:
-        base = json.load(fh)
-    if "ents" not in base:
-        return "no entry base"
-    out = os.path.join(tmp, "snap.json")
+def key_snap_main(argv):
+    """--key-snap ROOT OUT: snapshot ROOT and write its differences from the base (key_diff) as JSON."""
+    root, out = argv
+    with open(SD + ".pkl", "rb") as fh:
+        base = pickle.load(fh)
+    unstable = set(base["unstable"])
+
+    def want(key, whole, bag):
+        if key in unstable:
+            return bag != base["bags"].get(key)
+        rec = base["keys"].get(key)
+        return rec is None or rec[0] != whole
     try:
-        new = snap_run(tmp, out, base["unstable"])
-    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
-        return f"snapshot failed: {exc!r}"
+        keys, bags, stats = snap_state(root, base["unstable"], want)
+    except Exception as exc:  # noqa: BLE001
+        r = {"why": f"snapshot failed: {exc!r}"}
+    else:
+        r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats})
+    with open(out, "w") as fh:
+        json.dump(r, fh)
+    return 0
+
+
+def key_diff(base, new):
+    """{"diffs": [[key, module, gone, base record, new record]], "by_key": {key: changed entry keys, or None for a
+    holder not compared entry by entry}} ("#n": the size changed, "#order": the keys or their order), or
+    {"why": reason} when the trees cannot be compared."""
     nents = new["stats"].pop("ents", {})
     if new["stats"].get("deep") or new["stats"].get("opaque") != base["stats"].get("opaque"):
-        return f"snapshot not comparable: {new['stats']} vs {base['stats']}"
+        return {"why": f"snapshot not comparable: {new['stats']} vs {base['stats']}"}
     unstable, never, ent_never = set(base["unstable"]), set(base["never"]), set(base.get("ent_never", ()))
     diffs, by_key = [], {}
     for k in sorted(set(base["keys"]) | set(new["keys"])):
         a, b = base["keys"].get(k), new["keys"].get(k)
         if k in never:
-            return f"never comparable: {k}"
+            return {"why": f"never comparable: {k}"}
         if k in unstable:
             changed = a is None or b is None or base["bags"].get(k) != new["bags"].get(k) or a[1:] != b[1:]
         else:
             changed = a != b
         if not changed:
             continue
-        diffs.append((k, a, b))
+        diffs.append([k, (b or a)[2], b is None, a, b])
         ea, eb = base["ents"].get(k), nents.get(k)
         if ea is None or eb is None or k in ent_never:
             by_key[k] = None
@@ -1586,8 +1603,21 @@ def state_key_diff(tmp):
         ch = {sk for sk in set(ea) | set(eb) if ea.get(sk) != eb.get(sk)}
         if set(ea) - {"#n", "#order"} != set(eb) - {"#n", "#order"}:
             ch.add("#order")
-        by_key[k] = ch
-    return diffs, by_key
+        by_key[k] = sorted(ch)
+    return {"diffs": diffs, "by_key": by_key}
+
+
+def key_snap(files):
+    """The key check of a patched tree ({path: text}), in one fresh process; its answer (dict)."""
+    tmp = patched_tree(files)
+    try:
+        out = os.path.join(tmp, "keys.json")
+        subprocess.run([sys.executable, "-s", "-P", os.path.abspath(__file__), "--key-snap", tmp, out],
+                       env=snap_env(), check=True, cwd="/tmp", stdout=subprocess.DEVNULL, timeout=60)
+        with open(out) as fh:
+            return json.load(fh)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 KEY_BUDGET_S = float(os.environ.get("BR_KEY_BUDGET", 60))  # no key check starts after this many seconds
@@ -1658,17 +1688,7 @@ def key_check():
     changed keys, as JSON."""
     files = json.loads(sys.stdin.read())["files"]
     sys.dont_write_bytecode = True
-    tmp = patched_tree(files)
-    try:
-        r = state_key_diff(tmp)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    if isinstance(r, str):
-        print(json.dumps({"why": r}))
-        return 0
-    diffs, by_key = r
-    print(json.dumps({"diffs": [[k, (b or a)[2], b is None, a, b] for k, a, b in diffs],
-                      "by_key": {k: (None if v is None else sorted(v)) for k, v in by_key.items()}}))
+    print(json.dumps(key_snap(files)))
     return 0
 
 
@@ -1754,9 +1774,7 @@ def run_key_checks(jobs, t0):
         if time.time() - t0 > KEY_BUDGET_S:
             return k, None
         try:
-            p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--key-check"],
-                               input=json.dumps(jobs[k]), capture_output=True, text=True, timeout=60)
-            return k, json.loads(p.stdout.strip().splitlines()[-1])
+            return k, key_snap(jobs[k]["files"])
         except Exception as exc:  # noqa: BLE001
             print(f"{k}: key check: {exc!r}", file=sys.stderr)
             return k, None
@@ -2294,6 +2312,7 @@ SETUP_WALL_S = 12.0  # wall seconds between tests (imports, class fixtures)
 NO_RUN_FILES = ("tests/test_dialect_entry_points.py", "tests/test_sqlglotc.py")
 NO_RUN_IDS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}  # runs python in a subprocess
 RUN_DEBUG = os.environ.get("BR_RUN_DEBUG")
+RUN_CLEAN_P = float(os.environ.get("BR_RUN_CLEAN_P", 0.5))  # weight of the all-pass gain (runs without a failure: 0.17-0.27 of runs; 0.5 keeps every sample gain)
 MATE_P = 0.6  # share of commits with test_execute_tpcds a candidate where no classmate fails (gen2k: ~0.7)
 MATE_CHEAP_S = 2.0  # classmates that run first, ahead of the budget's order
 BROAD_BREAK = 8  # with this many failing tests, test_execute_tpcds stays whatever its classmates did
@@ -2994,6 +3013,14 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
     spend = spend_of(run)
     if gain <= spend:
         return None  # even if every run passes, the answer shrinks by less than the runs cost
+    # Most commits fail some candidate, and a failing test stays with its worker: expect the all-pass gain only with
+    # RUN_CLEAN_P, else the gain left when one test that runs fails (averaged over up to 16 of them).
+    fs = sorted(run, key=lambda n: (ms[n], n))
+    if len(fs) > 16:
+        fs = [fs[i * (len(fs) - 1) // 15] for i in range(16)]
+    one = sum(full - sim_cost(rest + [f], ms) for f in fs) / len(fs)
+    if RUN_CLEAN_P * gain + (1 - RUN_CLEAN_P) * max(0.0, one) <= spend:
+        return None
     skip_after = {n for n in run if cost(n) > max(0.03, AFTER_FAIL * ms[n] / 1000)}
     first = {}
     for n in sorted(run):
@@ -3399,8 +3426,10 @@ if __name__ == "__main__":
         sys.exit(cls_check())
     elif sys.argv[1:2] == ["--key-check"]:
         sys.exit(key_check())
+    elif sys.argv[1:2] == ["--key-snap"]:
+        sys.exit(key_snap_main(sys.argv[2:4]))
     elif sys.argv[1:2] == ["--snap"]:
-        sys.exit(snap_main(sys.argv[2:5]))
+        sys.exit(snap_main(sys.argv[2:6]))
     elif sys.argv[1:2] == ["--measure"]:
         measure_main(sys.argv[2])
     else:
