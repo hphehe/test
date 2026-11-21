@@ -2,14 +2,22 @@
 
 import ast
 import base64
+import copy
 import gzip
+import hashlib
 import json
 import os
+import pickle
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
+import time
 import warnings
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from bisect import bisect_right
 from pathlib import Path
 
@@ -17,7 +25,6 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).with_name("map.json.gz")))
 WORKER_MS = 2000
 MAX_WORKERS = 8
-# Probe notpcds: test_executor::test_execute_tpcds is never run (the rest is repacked).
 # Files whose change can alter how pytest runs every test.
 CONFIG_FILES = {"setup.cfg", "pyproject.toml", "setup.py", "conftest.py", "tests/conftest.py", "pytest.ini", "tox.ini"}
 # A line opening one of these clauses extends the statement before it rather than starting a new one.
@@ -634,6 +641,275 @@ def select(m, patch_text):
     return sel
 
 
+# ---------------------------------------------------------------- TPC-DS check
+# tests/test_executor.py::TestExecutor::test_execute_tpcds costs 21.5 s and runs most of the optimizer, so it is
+# selected for many changes, yet few of them change its outcome. The test parses every TPC-DS query (parent process),
+# executes those marked `execute` (child process: execute() = ensure_schema, optimize, a debug
+# expression.sql(pretty=True), Plan, the Python executor) and compares each result with duckdb running the query as
+# sqlglot transpiles it.
+# For a change that only edits function bodies, the check reruns the cheap stages on the patched code: parse (and
+# pickle) the affected queries, optimize them exactly as execute() does, render the debug sql, transpile to duckdb.
+# The map holds, per sqlglot line, which queries ran it in which stage, and the outputs at the pinned commit. When
+# every output is equal and no changed function runs after optimize (Plan, executor, tables) nor at import or in the
+# test's table setup, the executor gets the same input and runs the same code, so the outcome cannot change: the
+# test is dropped. Any doubt (other files, a line the stage record never saw, an error, a timeout) keeps it.
+
+TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_DEPS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/fixtures/optimizer/tpc-ds/",
+              "tests/fixtures/optimizer/tpc-h/")
+SQ = os.environ.get("BR_SQ", "/app/sq")  # the pinned sqlglot tree with .pyc, written by --prepare at build time
+CHECK_JOBS = 2
+CHECK_BUDGET_S = float(os.environ.get("BR_CHECK_BUDGET", 100))  # no check starts after this many seconds of the run
+CHECK_MAX_EST_S = 14  # nor one estimated to cost more CPU seconds than this
+
+
+def fingerprint(e):
+    """Everything later stages can read from a sqlglot tree: class, args in order, links, type, meta, comments.
+    Reads the slots directly, never sqlglot methods. Same function as mapbuild/tpcds_prof.py."""
+    from sqlglot.expressions import Expr
+    out = []
+    g = object.__getattribute__
+
+    def slot(x, name):
+        try:
+            return g(x, name)
+        except AttributeError:
+            return "<unset>"
+
+    def walk(x, parent, key, idx):
+        if isinstance(x, Expr):
+            out.append(f"<{type(x).__module__}.{type(x).__qualname__}|{int(slot(x, 'parent') is parent)}|"
+                       f"{slot(x, 'arg_key')!r}|{slot(x, 'index')!r}|")
+            args = slot(x, "args")
+            if not isinstance(args, dict):
+                out.append(f"ARGS?{type(args).__name__}")
+                args = {}
+            for k, v in args.items():
+                out.append(f"{k}=")
+                if isinstance(v, list):
+                    out.append("[")
+                    for i, y in enumerate(v):
+                        walk(y, x, k, i)
+                        out.append(",")
+                    out.append("]")
+                else:
+                    walk(v, x, k, None)
+                out.append(";")
+            t = slot(x, "_type")
+            if isinstance(t, Expr):
+                out.append("T:")
+                walk(t, None, None, None)
+            else:
+                out.append(f"T:{t!r}")
+            extra = getattr(x, "__dict__", None) or {}
+            out.append(f"M:{slot(x, '_meta')!r}C:{slot(x, 'comments')!r}D:{sorted(extra.items())!r}>")
+        elif isinstance(x, list):
+            out.append("[" + ",".join(repr(y) for y in x) + "]")
+        else:
+            out.append(f"{type(x).__name__}:{x!r}")
+
+    walk(e, None, None, None)
+    return hashlib.sha1("".join(out).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def outer_functions(tree):
+    """[(qualname, node)] of the functions not nested in another function, in source order."""
+    out = []
+
+    def walk(body, prefix):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                out.append((prefix + n.name, n))
+            elif isinstance(n, ast.ClassDef):
+                walk(n.body, prefix + n.name + ".")
+            else:
+                for f in ("body", "orelse", "finalbody", "handlers", "cases"):
+                    sub = getattr(n, f, None)
+                    if isinstance(sub, list):
+                        walk(sub, prefix)
+
+    walk(tree.body, "")
+    return out
+
+
+def changed_bodies(old_text, new_text):
+    """Old-numbered line spans of the bodies of the functions a change edits, or None when anything outside
+    function bodies differs (defs, decorators, defaults, classes, module or class level statements)."""
+    try:
+        old_t, new_t = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return None
+    of, nf = outer_functions(old_t), outer_functions(new_t)
+    if [q for q, _ in of] != [q for q, _ in nf]:
+        return None
+    spans = []
+    for (_, a), (_, b) in zip(of, nf):
+        if ast.dump(ast.Module(body=a.body, type_ignores=[])) != ast.dump(ast.Module(body=b.body, type_ignores=[])):
+            spans.append((a.body[0].lineno, a.end_lineno))
+    for t in (old_t, new_t):
+        for _, n in outer_functions(t):
+            n.body = [ast.Pass()]
+    if ast.dump(old_t) != ast.dump(new_t):
+        return None
+    return spans
+
+
+def line_span(m, path, ln):
+    """(start, end, mask) of the statement span holding line ln in the map's runtime rows, or None."""
+    for s, e, sid in m.d["files"][path]["rt"]:
+        if s <= ln <= e:
+            return s, e, m.set(sid)
+    return None
+
+
+def tpcds_job(m, patch_text, tp):
+    """The check that can drop test_execute_tpcds for this change, or None when it cannot apply."""
+    tq = m.d.get("tpq")
+    if not tq:
+        return None
+    files, spans = {}, []
+    for old, new, blocks in parse_patch(patch_text):
+        path = old or new
+        if not path:
+            return None
+        if path.startswith("sqlglot/"):
+            if not (old and new == old and path.endswith(".py") and path in m.d["files"]):
+                return None
+            text = m.source(path)
+            new_text = patched(text, blocks) if text is not None else None
+            sp = changed_bodies(text, new_text) if new_text is not None else None
+            if sp is None:
+                return None
+            files[path] = new_text
+            spans += [(path, a, b) for a, b in sp]
+            continue
+        paths = {old, new} - {None, ""}
+        for p in paths:
+            if p.endswith(".py") or p.startswith(TPCDS_DEPS) or p in CONFIG_FILES or "/" not in p:
+                return None
+            if p in m.d["opens"] and m.set(m.d["opens"][p]) >> tp & 1:
+                return None  # the test reads this file
+            if old != new or old is None:
+                return None  # a file added, removed or renamed outside sqlglot: the test may list a folder
+    if not files:
+        return None
+    lines = tq["lines"]
+    p_m = o_m = g_m = d_m = 0
+    for path, a, b in spans:
+        fl = lines.get(path, {})
+        for ln in range(a, b + 1):
+            row = fl.get(str(ln))
+            if row is None:
+                sp = line_span(m, path, ln)
+                if sp and sp[2] >> tp & 1 and not any(str(x) in fl for x in range(sp[0], sp[1] + 1)):
+                    # The test runs this statement, but no line of it is in any recorded stage. (Line events
+                    # fire on a statement's first line, so its other lines are often missing: that is fine.)
+                    return None
+                continue
+            p, o, g, d, x = row
+            if x:
+                return None  # runs at import, in table setup, or after optimize
+            p_m |= p
+            o_m |= o
+            g_m |= g
+            d_m |= d
+    ex = tq["exec_mask"]
+    q1 = (p_m & ex) | o_m | g_m
+    pn = p_m & ~ex
+    if (q1 | d_m) & tq["unstable_mask"] or not (q1 | pn | d_m):
+        return None
+    qs = tq["q"]
+    est = 1.0 + sum(qs[i]["cpu"] for i in range(len(qs)) if (q1 | d_m) >> i & 1)
+    if est > CHECK_MAX_EST_S:
+        return None
+    pick = lambda mask, keys: [{"i": i, **{k: qs[i][k] for k in keys}} for i in range(len(qs)) if mask >> i & 1]  # noqa: E731
+    return {"files": files, "schema": tq["schema"], "est": est, "q1": pick(q1, ("sql", "fo")),
+            "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck"))}
+
+
+def tpcds_check():
+    """Child process: stdin is a job from tpcds_job. Prints "same" last when every output equals the pinned one."""
+    job = json.loads(sys.stdin.read())
+    sys.dont_write_bytecode = True
+    tmp = tempfile.mkdtemp(prefix="tpc")
+    try:
+        shutil.copytree(os.path.join(SQ, "sqlglot"), os.path.join(tmp, "sqlglot"))  # copy2: the .pyc stay valid
+        for path, text in job["files"].items():
+            with open(os.path.join(tmp, path), "w", encoding="utf-8", newline="") as fh:
+                fh.write(text)
+        sys.path.insert(0, tmp)
+        import sqlglot
+        if not os.path.abspath(sqlglot.__file__).startswith(tmp):
+            print("wrong sqlglot", sqlglot.__file__)
+            return 1
+        # What the test's child imports (tests/test_executor.py), so the same modules are loaded.
+        from sqlglot import exp, find_tables, parse_one, transpile  # noqa: F401
+        from sqlglot.errors import ExecuteError  # noqa: F401
+        from sqlglot.executor import env, execute  # noqa: F401
+        from sqlglot.executor.python import Python, PythonExecutor  # noqa: F401
+        from sqlglot.executor.table import Table, ensure_tables  # noqa: F401
+        from sqlglot.optimizer import optimize  # noqa: F401
+        from sqlglot.planner import Plan  # noqa: F401
+        import sqlglot.executor as sx
+        for q in job["pn"]:
+            pickle.loads(pickle.dumps(parse_one(q["sql"])))
+        for q in job["q1"]:
+            e = pickle.loads(pickle.dumps(parse_one(q["sql"])))
+            schema = sx.ensure_schema(copy.deepcopy(job["schema"]), dialect=None)
+            o = sx.optimize(e, schema, leave_tables_isolated=True, dialect=None)
+            if fingerprint(o) != q["fo"]:
+                print("optimize differs", q["i"])
+                return 1
+            o.sql(pretty=True)
+        for q in job["d"]:
+            if transpile(q["sql"], write="duckdb")[0] != q["duck"]:
+                print("duckdb sql differs", q["i"])
+                return 1
+        print("same")
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_checks(jobs, t0):
+    """{commit: True when the check proved the test unaffected}. Two at a time; none starts after the budget."""
+    def one(k):
+        if time.time() - t0 > CHECK_BUDGET_S:
+            return k, False
+        job = jobs[k]
+        try:
+            p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--tpcds-check"],
+                               input=json.dumps(job), capture_output=True, text=True, timeout=max(20.0, 4 * job["est"]))
+        except subprocess.TimeoutExpired:
+            print(f"{k}: tpcds check timed out", file=sys.stderr)
+            return k, False
+        lines = p.stdout.strip().splitlines()
+        ok = p.returncode == 0 and lines[-1:] == ["same"]
+        if not ok:
+            print(f"{k}: tpcds check keeps the test: rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}",
+                  file=sys.stderr)
+        return k, ok
+
+    if not jobs:
+        return {}
+    with ThreadPoolExecutor(CHECK_JOBS) as ex:
+        return dict(ex.map(one, sorted(jobs, key=lambda k: jobs[k]["est"])))
+
+
+def prepare(dest):
+    """Build time: write the pinned sqlglot tree from the map and compile it, for the checks."""
+    import compileall
+    m = Map(MAP)
+    for path, b in m.d["src"].items():
+        if path.startswith("sqlglot/"):
+            p = os.path.join(dest, path)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write(m.source(path))
+    ok = compileall.compile_dir(os.path.join(dest, "sqlglot"), quiet=1)
+    print("prepared", dest, "compiled" if ok else "COMPILE ERRORS")
+
+
 def pack(tests, ms):
     """The cheapest split: for 1..8 workers, longest test first onto the lightest worker."""
     if not tests:
@@ -654,20 +930,44 @@ def pack(tests, ms):
 
 
 def main():
+    t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
     m = Map(MAP)
+    rows, jobs = [], {}
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        text = patch.read_text(encoding="utf-8", errors="replace")
         try:
-            mask = select(m, patch.read_text(encoding="utf-8", errors="replace"))
+            mask = select(m, text)
         except Exception as exc:  # never crash a run: run everything for this commit
             print(f"{patch.stem}: {exc!r}", file=sys.stderr)
             mask = m.all_tests()
         chosen = [n for n in ms if mask >> n & 1]
-        tpcds = {t["number"] for t in tests if t["id"] == "tests/test_executor.py::TestExecutor::test_execute_tpcds"}
-        chosen = [n for n in chosen if n not in tpcds]
-        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}))
+        rows.append((patch.stem, chosen))
+        if tp is not None and mask >> tp & 1:
+            try:
+                job = tpcds_job(m, text, tp)
+            except Exception as exc:  # noqa: BLE001  (no check: keep the test)
+                print(f"{patch.stem}: tpcds job: {exc!r}", file=sys.stderr)
+                job = None
+            if job is not None:
+                jobs[patch.stem] = job
+    try:
+        dropped = run_checks(jobs, t0)
+    except Exception as exc:  # noqa: BLE001
+        print(f"tpcds checks: {exc!r}", file=sys.stderr)
+        dropped = {}
+    for stem, chosen in rows:
+        if dropped.get(stem):
+            chosen = [n for n in chosen if n != tp]
+        print(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--prepare"]:
+        prepare(sys.argv[2])
+    elif sys.argv[1:2] == ["--tpcds-check"]:
+        sys.exit(tpcds_check())
+    else:
+        main()
