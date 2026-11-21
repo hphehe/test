@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import json
 import os
+import types
 import pickle
 import re
 import shutil
@@ -2006,14 +2007,14 @@ def build_tables(m, dest, out):
 # fresh: any other change of sqlglot/ or tests/ Python: the child drops the loaded sqlglot and tests modules and
 #        imports the patched tree from memory.
 # Fixture edits reach the tests through open(). Tests that use other processes run their pool tasks in-process
-# (InlinePool). Long tests, tests that read changed files by other means, and tests that do not pass here on the
+# (use_local_pool). Long tests, tests that read changed files by other means, and tests that do not pass here on the
 # pinned tree (map "run" field) never run here.
 
 ST = os.environ.get("BR_ST", "/app/st")  # the whole pinned tree (sqlglot, tests, fixtures), written by --prepare
 PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 RUN_DEADLINE_S = float(os.environ.get("BR_RUN_WALL", 150))  # no child runs past this many seconds of the run
-HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, HOLD_FACTOR * (2 s + its recorded seconds))
-HOLD_FACTOR = 0.7
+HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, RUN_SHARE * (2 s + its recorded seconds))
+RUN_SHARE = 0.7
 HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of test runs per commit
 FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
 FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
@@ -2026,7 +2027,54 @@ NO_RUN_IDS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}  # 
 RUN_DEBUG = os.environ.get("BR_RUN_DEBUG")
 MATE_P = 0.6  # share of commits with test_execute_tpcds a candidate where no classmate fails (gen2k: ~0.7)
 MATE_CHEAP_S = 2.0  # classmates that run first, ahead of the budget's order
-MANY_FAILURES = 8  # with this many failing tests, test_execute_tpcds stays whatever its classmates did
+BROAD_BREAK = 8  # with this many failing tests, test_execute_tpcds stays whatever its classmates did
+EXEC_CLASS = "tests/test_executor.py::TestExecutor"
+EXEC_TABLE_USERS = {"test_optimized_tpch", "test_execute_tpch", "test_execute_tpcds"}  # the tests that read the TPC
+# tables TestExecutor.setUpClass builds (1.4 s); the class's other tests never touch them
+EXEC_SETUP_FILES = ("tests/test_executor.py", "tests/helpers.py", "sqlglot/executor/table.py")  # what that setup runs
+EXEC_LAZY_NAMES = ("tpch_conn", "tpcds_conn", "tpch_tables", "tpcds_tables", "tpch_sqls", "tpcds_sqls")
+
+
+def exec_lazy_ok(files):
+    """TestExecutor's TPC tables may be built on first use when the patch changes nothing that building runs or
+    reads (the setup's own code, the helpers, the executor's Table, the TPC fixtures)."""
+    return not any(p in EXEC_SETUP_FILES or p.startswith(MATE_OFF_DIRS) for p in files)
+
+
+def install_exec_lazy(cls, put):
+    """Replace TestExecutor.setUpClass so that the TPC tables are built when a test first reads them. Should that
+    build fail, the eager setup would have failed every test of the class: the whole run is then in doubt."""
+    real_setup, real_teardown = cls.__dict__["setUpClass"], cls.__dict__.get("tearDownClass")
+    state = {"built": False}
+
+    class Lazy:
+        def __init__(self, name):
+            self.name = name
+
+        def __get__(self, obj, owner):
+            if not state["built"]:
+                state["built"] = True
+                for n in EXEC_LAZY_NAMES:
+                    if isinstance(cls.__dict__.get(n), Lazy):
+                        delattr(cls, n)
+                try:
+                    real_setup.__func__(cls)
+                except BaseException:
+                    put("X lazy TestExecutor setup failed")
+                    raise
+            return getattr(cls, self.name)
+
+    def set_up(c):
+        for n in EXEC_LAZY_NAMES:
+            setattr(cls, n, Lazy(n))
+        cls.cache = {}
+
+    def tear_down(c):
+        if state["built"] and real_teardown is not None:
+            real_teardown.__func__(cls)
+
+    cls.setUpClass = classmethod(set_up)
+    cls.tearDownClass = classmethod(tear_down)
 MATE_LONG_MS = 15000  # classmates are tests recorded at most this long
 MATE_OFF_FILES = ("tests/test_executor.py",)  # the test's own code: its classmates say nothing about it
 MATE_OFF_DIRS = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")
@@ -2038,67 +2086,79 @@ def _log(*a):
         print(*a, file=sys.stderr, flush=True)
 
 
-def same_const(x, y):
-    return type(x) is type(y) and repr(x) == repr(y)
+_FN_FIELDS = ("co_code", "co_names", "co_varnames", "co_freevars", "co_cellvars", "co_flags", "co_argcount",
+              "co_kwonlyargcount", "co_posonlyargcount", "co_exceptiontable", "co_qualname")
+_BODY_FIELDS = ("co_code", "co_names", "co_varnames", "co_exceptiontable", "co_flags")
 
 
-def code_same(x, y):
-    """Same behaviour: everything but line numbers (nested code compared the same way)."""
-    if (x.co_code != y.co_code or x.co_names != y.co_names or x.co_varnames != y.co_varnames
-            or x.co_freevars != y.co_freevars or x.co_cellvars != y.co_cellvars or x.co_flags != y.co_flags
-            or x.co_argcount != y.co_argcount or x.co_kwonlyargcount != y.co_kwonlyargcount
-            or x.co_posonlyargcount != y.co_posonlyargcount or x.co_exceptiontable != y.co_exceptiontable
-            or x.co_qualname != y.co_qualname or len(x.co_consts) != len(y.co_consts)):
+def _is_code(o):
+    return isinstance(o, types.CodeType)
+
+
+def _ident(c):
+    return c.co_qualname, c.co_freevars, c.co_name
+
+
+def consts_match(a, b):
+    return type(a) is type(b) and repr(a) == repr(b)
+
+
+def same_behaviour(x, y):
+    """True when two code objects differ at most in line numbers (nested code objects alike)."""
+    if any(getattr(x, f) != getattr(y, f) for f in _FN_FIELDS) or len(x.co_consts) != len(y.co_consts):
         return False
     for a, b in zip(x.co_consts, y.co_consts):
-        ca, cb = hasattr(a, "co_code"), hasattr(b, "co_code")
-        if ca != cb or (ca and not code_same(a, b)) or (not ca and not same_const(a, b)):
+        if _is_code(a) != _is_code(b):
+            return False
+        if not (same_behaviour(a, b) if _is_code(a) else consts_match(a, b)):
             return False
     return True
 
 
-def deftime_equal(a, b, pairs):
-    """Module or class body code that does the same; the function code found on the way goes to pairs."""
-    if (a.co_code != b.co_code or a.co_names != b.co_names or a.co_varnames != b.co_varnames
-            or a.co_exceptiontable != b.co_exceptiontable or a.co_flags != b.co_flags
-            or len(a.co_consts) != len(b.co_consts)):
+def body_match(a, b, found):
+    """True when a module or class body runs the same statements in both versions. The function code objects the
+    two bodies make are collected in `found` as (pinned, patched) pairs and judged afterwards."""
+    if any(getattr(a, f) != getattr(b, f) for f in _BODY_FIELDS) or len(a.co_consts) != len(b.co_consts):
         return False
     for x, y in zip(a.co_consts, b.co_consts):
-        cx, cy = hasattr(x, "co_code"), hasattr(y, "co_code")
-        if cx != cy:
+        if _is_code(x) != _is_code(y):
             return False
-        if cx:
-            if (x.co_flags & CO_OPTIMIZED) != (y.co_flags & CO_OPTIMIZED):
+        if not _is_code(x):
+            if not consts_match(x, y):
                 return False
-            if x.co_flags & CO_OPTIMIZED:
-                if x.co_qualname != y.co_qualname or x.co_freevars != y.co_freevars or x.co_name != y.co_name:
-                    return False
-                pairs.append((x, y))
-            elif not deftime_equal(x, y, pairs):
-                return False
-        elif not same_const(x, y):
+            continue
+        is_fn = x.co_flags & CO_OPTIMIZED
+        if is_fn != y.co_flags & CO_OPTIMIZED:
             return False
+        if not is_fn:  # a class body inside
+            if not body_match(x, y, found):
+                return False
+        elif _ident(x) != _ident(y):
+            return False
+        else:
+            found.append((x, y))
     return True
 
 
-def changed_pairs(pairs):
-    """The pairs whose code differs, nested ones included; None when a swap cannot reproduce the patched module
-    (a changed docstring: __doc__ is set when the function is made; nested functions of another shape)."""
-    out, stack = [], list(pairs)
-    while stack:
-        x, y = stack.pop()
-        if code_same(x, y):
+def differing_functions(found):
+    """The (pinned, patched) pairs whose code differs, nested functions included; None when putting the new code
+    into the live functions could not give the patched behaviour (a changed docstring, which is bound when the
+    function is made, or nested functions that no longer line up)."""
+    diff, todo = [], list(found)
+    while todo:
+        x, y = todo.pop()
+        if same_behaviour(x, y):
             continue
-        if x.co_consts[:1] != y.co_consts[:1] and any(isinstance(c, str) for c in x.co_consts[:1] + y.co_consts[:1]):
+        dx, dy = x.co_consts[:1], y.co_consts[:1]
+        if dx != dy and any(isinstance(c, str) for c in dx + dy):
             return None
-        out.append((x, y))
-        xc = [c for c in x.co_consts if hasattr(c, "co_code")]
-        yc = [c for c in y.co_consts if hasattr(c, "co_code")]
-        if len(xc) != len(yc) or any(a.co_qualname != b.co_qualname or a.co_freevars != b.co_freevars
-                                     or a.co_name != b.co_name for a, b in zip(xc, yc)):
+        diff.append((x, y))
+        kx = [c for c in x.co_consts if _is_code(c)]
+        ky = [c for c in y.co_consts if _is_code(c)]
+        if len(kx) != len(ky) or any(_ident(u) != _ident(v) for u, v in zip(kx, ky)):
             return None
-        stack.extend(zip(xc, yc))
-    return out
+        todo.extend(zip(kx, ky))
+    return diff
 
 
 def run_plan(m, text):
@@ -2158,7 +2218,7 @@ def run_plan(m, text):
             except (SyntaxError, ValueError):
                 return None
         got = []
-        ch = changed_pairs(got) if deftime_equal(a, b, got) else None
+        ch = differing_functions(got) if body_match(a, b, got) else None
         if ch is None:
             plan["mode"] = "fresh"
         else:
@@ -2168,7 +2228,9 @@ def run_plan(m, text):
     return plan
 
 
-class _MemLoader:
+class _SourceLoader:
+    """Loads one module of the patched tree from its text in memory."""
+
     def __init__(self, path, text):
         self.path, self.text = path, text
 
@@ -2177,8 +2239,9 @@ class _MemLoader:
 
     def exec_module(self, module):
         import marshal
-        code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
-        exec(marshal.loads(marshal.dumps(code)), module.__dict__)  # constants as a .pyc gives them
+        raw = self.text.encode("utf-8", "surrogateescape")
+        # through marshal, so that constants come out as they do from a .pyc
+        exec(marshal.loads(marshal.dumps(compile(raw, self.path, "exec", dont_inherit=True))), module.__dict__)
 
     def get_source(self, name):
         return self.text
@@ -2187,8 +2250,9 @@ class _MemLoader:
         return self.path
 
 
-class _Overlay:
-    """Meta path finder: patched or added sqlglot and tests modules from memory; deleted ones raise."""
+class _PatchedFinder:
+    """First on sys.meta_path in a child: sqlglot and tests modules the patch adds or changes come from memory,
+    the ones it deletes do not import, all others load from the pinned tree as usual."""
 
     def __init__(self, files):
         self.files = files
@@ -2197,101 +2261,106 @@ class _Overlay:
         import importlib.util
         if name.partition(".")[0] not in ("sqlglot", "tests"):
             return None
-        rel = name.replace(".", "/")
-        for cand, pkg in ((rel + "/__init__.py", True), (rel + ".py", False)):
-            if cand in self.files:
-                if self.files[cand] is None:
-                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
-                full = os.path.join(ST, cand)
-                return importlib.util.spec_from_file_location(
-                    name, full, loader=_MemLoader(full, self.files[cand]),
-                    submodule_search_locations=[os.path.dirname(full)] if pkg else None)
-            if os.path.exists(os.path.join(ST, cand)):
-                return None
+        base = name.replace(".", "/")
+        for rel, is_pkg in ((base + "/__init__.py", True), (base + ".py", False)):
+            if rel not in self.files:
+                if os.path.exists(os.path.join(ST, rel)):
+                    return None
+                continue
+            text = self.files[rel]
+            if text is None:
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            where = os.path.join(ST, rel)
+            return importlib.util.spec_from_file_location(
+                name, where, loader=_SourceLoader(where, text),
+                submodule_search_locations=[os.path.dirname(where)] if is_pkg else None)
         return None
 
 
-def install_open_overlay(files):
-    """open() (builtins, io) gives the patched text of the changed files; a deleted one is not found."""
+_NOT_PATCHED = object()
+
+
+def serve_patched_files(files):
+    """Reading a changed file by name (open, io.open, io.open_code) gives its patched text; a deleted file is
+    missing. Writes and every other file go to the real functions."""
     import builtins
     import io
-    table = {os.path.join(ST, rel): t for rel, t in files.items()}
-    real_open, real_open_code = builtins.open, io.open_code
+    patched = {os.path.join(ST, rel): text for rel, text in files.items()}
+    _open0, _open_code0 = builtins.open, io.open_code
 
-    def key_of(file):
-        if isinstance(file, (str, os.PathLike)):
-            try:
-                return os.path.abspath(os.fspath(file))
-            except (TypeError, ValueError):
-                return None
-        return None
+    def lookup(file):
+        if not isinstance(file, (str, os.PathLike)):
+            return _NOT_PATCHED
+        try:
+            return patched.get(os.path.abspath(os.fspath(file)), _NOT_PATCHED)
+        except (TypeError, ValueError):
+            return _NOT_PATCHED
 
-    def opener(file, mode="r", *args, **kwargs):
-        k = key_of(file)
-        if k is not None and k in table and not any(c in mode for c in "wax+"):
-            t = table[k]
-            if t is None:
-                raise FileNotFoundError(2, "No such file or directory", str(file))
-            data = io.BytesIO(t.encode("utf-8", "surrogateescape"))
-            if "b" in mode:
-                return data
-            return io.TextIOWrapper(data, encoding=kwargs.get("encoding", args[1] if len(args) > 1 else None),
-                                    errors=kwargs.get("errors", args[2] if len(args) > 2 else None),
-                                    newline=kwargs.get("newline", args[3] if len(args) > 3 else None))
-        return real_open(file, mode, *args, **kwargs)
+    def as_bytes(file, text):
+        if text is None:
+            raise FileNotFoundError(2, "No such file or directory", str(file))
+        return io.BytesIO(text.encode("utf-8", "surrogateescape"))
 
-    def open_code(path):
-        k = key_of(path)
-        if k is not None and k in table:
-            if table[k] is None:
-                raise FileNotFoundError(2, "No such file or directory", str(path))
-            return io.BytesIO(table[k].encode("utf-8", "surrogateescape"))
-        return real_open_code(path)
+    def open_patched(file, mode="r", *args, **kwargs):
+        text = _NOT_PATCHED if set(mode) & set("wax+") else lookup(file)
+        if text is _NOT_PATCHED:
+            return _open0(file, mode, *args, **kwargs)
+        raw = as_bytes(file, text)
+        if "b" in mode:
+            return raw
+        opt = dict(zip(("buffering", "encoding", "errors", "newline"), args))
+        opt.update(kwargs)
+        return io.TextIOWrapper(raw, encoding=opt.get("encoding"), errors=opt.get("errors"), newline=opt.get("newline"))
 
-    builtins.open = opener
-    io.open = opener
-    io.open_code = open_code
+    def open_code_patched(path):
+        text = lookup(path)
+        return _open_code0(path) if text is _NOT_PATCHED else as_bytes(path, text)
+
+    builtins.open = open_patched
+    io.open = open_patched
+    io.open_code = open_code_patched
 
 
-def install_inline_pool():
-    """concurrent.futures.ProcessPoolExecutor runs each task in this process when its result is asked for, with what
-    a test can observe of a real pool: arguments and results through pickle, the task's exception from result(), and
-    a pool whose worker would have died broken for every later task. Before the test modules import it."""
+def use_local_pool():
+    """Replace concurrent.futures.ProcessPoolExecutor, before the test modules import it, with a stand-in that does
+    each task here, the first time its outcome is wanted. What a test can tell apart from real workers stays the
+    same: the call and its value go through pickle, a task's exception comes back from result(), and after an
+    initializer that raised or a task that exited, the pool refuses all further tasks."""
     import concurrent.futures as cf
+    from concurrent.futures.process import BrokenProcessPool
 
-    def broken():
-        from concurrent.futures.process import BrokenProcessPool
-        return BrokenProcessPool("A process in the process pool was terminated abruptly")
+    def unusable():
+        return BrokenProcessPool("A process in the process pool was terminated abruptly while the future was "
+                                 "running or pending.")
 
-    class InlineFuture(cf.Future):
-        def __init__(self, pool, fn, args, kwargs):
+    class _Deferred(cf.Future):
+        def __init__(self, owner, call):
             super().__init__()
-            self._br = (pool, fn, args, kwargs)
+            self._owner, self._call = owner, call
             self._state = "FINISHED"
 
-        def _compute(self):
-            if self._br is None:
+        def _settle(self):
+            call, self._call = self._call, None
+            if call is None:
                 return
-            pool, fn, args, kwargs = self._br
-            self._br = None
-            if pool._broken or not pool._start():
-                self._exception = broken()
+            if not self._owner._usable():
+                self._exception = unusable()
                 return
             try:
-                payload = pickle.dumps((fn, args, kwargs))
-            except BaseException as e:  # noqa: BLE001  (the real pool reports it on the future)
+                blob = pickle.dumps(call)
+            except BaseException as e:  # noqa: BLE001  (a real pool reports it on the future too)
                 self._exception = e
                 return
             try:
-                fn, args, kwargs = pickle.loads(payload)
+                fn, args, kwargs = pickle.loads(blob)
                 value = fn(*args, **kwargs)
             except SystemExit:
-                pool._broken = True
-                self._exception = broken()
+                self._owner._dead = True
+                self._exception = unusable()
                 return
+            except KeyboardInterrupt:
+                raise
             except BaseException as e:  # noqa: BLE001
-                if isinstance(e, KeyboardInterrupt):
-                    raise
                 self._exception = e
                 return
             try:
@@ -2300,51 +2369,49 @@ def install_inline_pool():
                 self._exception = e
 
         def result(self, timeout=None):
-            self._compute()
+            self._settle()
             if self._exception is not None:
                 raise self._exception
             return self._result
 
         def exception(self, timeout=None):
-            self._compute()
+            self._settle()
             return self._exception
 
         def cancel(self):
             return False
 
-    class InlinePool:
+    class LocalPool:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
-            self._init = (initializer, initargs)
-            self._started = self._broken = self._shutdown = False
+            self._setup = (initializer, initargs)
+            self._began = self._dead = self._closed = False
 
-        def _start(self):
-            if self._started:
-                return not self._broken
-            self._started = True
-            fn, args = self._init
-            if fn is not None:
-                try:
-                    fn(*args)
-                except BaseException as e:  # noqa: BLE001
-                    if isinstance(e, KeyboardInterrupt):
+        def _usable(self):
+            if not self._began:
+                self._began = True
+                fn, args = self._setup
+                if fn is not None:
+                    try:
+                        fn(*args)
+                    except KeyboardInterrupt:
                         raise
-                    self._broken = True
-                    return False
-            return True
+                    except BaseException:  # noqa: BLE001
+                        self._dead = True
+            return not self._dead
 
         def submit(self, fn, /, *args, **kwargs):
-            if self._broken:
-                raise broken()
-            if self._shutdown:
+            if self._dead:
+                raise unusable()
+            if self._closed:
                 raise RuntimeError("cannot schedule new futures after shutdown")
-            return InlineFuture(self, fn, args, kwargs)
+            return _Deferred(self, (fn, args, kwargs))
 
         def map(self, fn, *iterables, timeout=None, chunksize=1):
-            fs = [self.submit(fn, *a) for a in zip(*iterables)]
-            return (f.result() for f in fs)
+            futures = [self.submit(fn, *a) for a in zip(*iterables)]
+            return (f.result() for f in futures)
 
         def shutdown(self, wait=True, *, cancel_futures=False):
-            self._shutdown = True
+            self._closed = True
 
         def __enter__(self):
             return self
@@ -2353,7 +2420,7 @@ def install_inline_pool():
             self.shutdown()
             return False
 
-    cf.ProcessPoolExecutor = InlinePool
+    cf.ProcessPoolExecutor = LocalPool
 
 
 def function_index():
@@ -2412,10 +2479,10 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
                 codes += all_codes(y)
         py = {p: t for p, t in files.items() if p.endswith(".py")}
         if py:
-            sys.meta_path.insert(0, _Overlay(py))
+            sys.meta_path.insert(0, _PatchedFinder(py))
             importlib.invalidate_caches()
         if files:
-            install_open_overlay(files)
+            serve_patched_files(files)
         cur = [None, False]
         mon = sys.monitoring
         if codes:
@@ -2429,7 +2496,7 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
             for c in {id(c): c for c in codes}.values():
                 mon.set_local_events(mon.PROFILER_ID, c, mon.events.PY_START)
         failed_import = {}
-        any_failed = [False]
+        failed_once = [False]
         suite = unittest.TestSuite()
         for n in order:
             path, cls_name, meth = tests[n]["id"].split("::")
@@ -2445,14 +2512,14 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
                 case = getattr(mod, cls_name)(meth)
             except Exception:  # noqa: BLE001  (the module does not import, or the test is gone)
                 put(f"V {n} 1 0 0")
-                any_failed[0] = True
+                failed_once[0] = True
                 continue
             case._br_n = n
             if n in skip_after:
                 real = getattr(case, meth)
 
                 def method(*a, _real=real, _case=case, **k):
-                    if any_failed[0]:
+                    if failed_once[0]:
                         _case._br_skip = True
                         raise unittest.SkipTest("after a failure")
                     return _real(*a, **k)
@@ -2462,50 +2529,58 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
         if plan and plan["mode"] == "fresh":
             import gc
             gc.freeze()
+        te = sys.modules.get("tests.test_executor")
+        if (exec_lazy_ok(files) and te is not None and isinstance(getattr(te, "TestExecutor", None), type)
+                and "setUpClass" in te.TestExecutor.__dict__
+                and not any(tests[n]["id"].rsplit("::", 1)[1] in EXEC_TABLE_USERS for n in order
+                            if tests[n]["id"].startswith(EXEC_CLASS + "::"))):
+            install_exec_lazy(te.TestExecutor, put)
 
-        class Verdicts(unittest.TestResult):
+        class _Tally(unittest.TestResult):
+            """Reports each test as it ends: pass, fail, or not run (skipped)."""
+
             def __init__(self):
                 super().__init__()
-                self.failfast = True  # a failing subtest ends its test (TestCase.subTest reads it)
-                self._b, self._skip, self._t = 0, False, 0.0
+                # subTest checks this flag: the first failing subtest then ends its test, which is all we need
+                self.failfast = True
+                self._marks = (0, False, 0.0)  # problems counted before the test, skipped, CPU at start
 
-            def stop(self):  # failfast must not end the whole run
-                pass
+            def stop(self):
+                pass  # with failfast set, unittest would call this and end the suite; every test must still run
 
-            def _exc_info_to_string(self, err, test):  # only pass or fail counts: no traceback formatting
-                return ""
+            def _exc_info_to_string(self, err, test):
+                return ""  # the outcome is all that is reported, so the traceback text is never built
 
-            def _bad(self):
-                return len(self.failures) + len(self.errors) + len(self.unexpectedSuccesses)
+            def _problems(self):
+                return sum(map(len, (self.failures, self.errors, self.unexpectedSuccesses)))
 
             def startTest(self, test):
                 super().startTest(test)
-                self._b, self._skip = self._bad(), False
                 cur[0], cur[1] = test._br_n, False
                 if codes:
                     mon.restart_events()
                 put(f"S {test._br_n}")
-                self._t = time.process_time()
+                self._marks = (self._problems(), False, time.process_time())
 
             def addSkip(self, test, reason):
                 super().addSkip(test, reason)
-                self._skip = True
+                self._marks = self._marks[:1] + (True,) + self._marks[2:]
 
             def addError(self, test, err):
                 super().addError(test, err)
-                if not hasattr(test, "_br_n"):  # a class or module fixture failed
+                if not hasattr(test, "_br_n"):  # setUpClass / setUpModule (or their teardown) raised
                     put("X fixture error")
 
             def stopTest(self, test):
                 super().stopTest(test)
-                n = test._br_n
-                code = 1 if self._bad() > self._b else (2 if self._skip else 0)
+                before, skipped, t0 = self._marks
+                code = 1 if self._problems() > before else 2 if skipped else 0
                 if code == 1:
-                    any_failed[0] = True
-                put(f"V {n} {code} {int(cur[1])} {int((time.process_time() - self._t) * 1e6)}")
+                    failed_once[0] = True
+                put(f"V {test._br_n} {code} {int(cur[1])} {int((time.process_time() - t0) * 1e6)}")
                 cur[0] = None
 
-        suite.run(Verdicts())
+        suite.run(_Tally())
         put("END")
     except BaseException as e:  # noqa: BLE001
         try:
@@ -2516,7 +2591,7 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
         os._exit(0)
 
 
-def run_child(plan, order, tests, idx, skip_after, allowed, cap, time_left):
+def fork_run(plan, order, tests, idx, skip_after, allowed, cap, wall_left):
     """Fork, run, collect. ({n: (code, reached, cpu)}, status END / TIMEOUT / DIED, doubt or None)."""
     import select
     import signal
@@ -2533,7 +2608,7 @@ def run_child(plan, order, tests, idx, skip_after, allowed, cap, time_left):
     os.close(w)
     verdicts, status, doubt = {}, "DIED", None
     now = time.monotonic()
-    t_end, t_next, t_cap = now + time_left, now + SETUP_WALL_S, None
+    t_end, t_next, t_cap = now + wall_left, now + SETUP_WALL_S, None
     buf = b""
     try:
         while True:
@@ -2614,8 +2689,13 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
         return not (tid in bad or tid in NO_RUN_IDS or tid.startswith(NO_RUN_FILES) or tid.count("::") != 2
                     or ms[n] / 1000 > LONG_S or readers >> n & 1)
 
+    lazy = exec_lazy_ok(plan["files"])
+
     def spend_of(ts):
         classes = {tests[n]["id"].rsplit("::", 1)[0] for n in ts}
+        if lazy and not any(tests[n]["id"].startswith(EXEC_CLASS + "::")
+                            and tests[n]["id"].rsplit("::", 1)[1] in EXEC_TABLE_USERS for n in ts):
+            classes.discard(EXEC_CLASS)  # its tables are never built (install_exec_lazy)
         x = sum(cost(n) for n in ts) + sum(cls_cpu.get(c, 0.0) for c in classes)
         return x + (info.get("imp", FRESH_IMPORT_S) if plan["mode"] == "fresh" else 0.02)
 
@@ -2625,7 +2705,7 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
     # cheap run first: test_execute_tpcds is left out unless one of the classmates that ran fails (see runner_phase).
     protect = {n for n in cands if tp_on and mates_all >> n & 1 and runnable(n) and cost(n) <= MATE_CHEAP_S}
     run = [n for n in cands if runnable(n) and (n in protect or
-                                                cost(n) <= max(HOLD_FLOOR_S, HOLD_FACTOR * (WORKER_MS / 1000 + ms[n] / 1000)))]
+                                                cost(n) <= max(HOLD_FLOOR_S, RUN_SHARE * (WORKER_MS / 1000 + ms[n] / 1000)))]
     budget = HOT_BUDGET_S if plan["mode"] == "hot" else FRESH_BUDGET_S
     if sum(cost(n) for n in run if n not in protect) > budget:
         keep, acc = set(), 0.0
@@ -2715,7 +2795,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
         os.environ.setdefault(k, "1")
     os.chdir(ST)
     sys.path.insert(0, ST)
-    install_inline_pool()
+    use_local_pool()
     # The parent imports the test modules of every run once (sqlglot with them), watching whether a changed
     # function starts or a changed file is opened meanwhile: such a hot commit becomes fresh.
     watch = {}
@@ -2771,7 +2851,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
         try:
             exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
             before = os.times()
-            verdicts, status, doubt = run_child(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0)
+            verdicts, status, doubt = fork_run(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0)
             after = os.times()
             used = after.children_user + after.children_system - before.children_user - before.children_system
         except Exception as exc:  # noqa: BLE001
@@ -2787,7 +2867,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
         # test_execute_tpcds stays when a classmate that ran fails, when a classmate's pass is not trusted (a hot
         # run that never reached the changed code it was expected to reach), or when many tests fail. On 106
         # labelled commits that select it, every one of the 13 where it fails also fails a cheap classmate.
-        if (mates and status == "END" and all(n in verdicts for n in run) and len(failing) < MANY_FAILURES
+        if (mates and status == "END" and all(n in verdicts for n in run) and len(failing) < BROAD_BREAK
                 and not any(mates_all >> n & 1 for n in failing) and any(n in passed for n in mates)
                 and not any(mates_all >> n & 1 and v[0] == 0 and n not in passed for n, v in verdicts.items())):
             tp_ok.add(c)
@@ -2807,7 +2887,7 @@ def measure_main(out_path):
         os.environ.setdefault(k, "1")
     os.chdir(ST)
     sys.path.insert(0, ST)
-    install_inline_pool()
+    use_local_pool()
     by_class = {}
     for t in tests:
         if t["id"].count("::") == 2:
@@ -2824,7 +2904,7 @@ def measure_main(out_path):
     cpu, cls, bad = {}, {}, []
     for c, nums in sorted(by_class.items()):
         before = os.times()
-        v, status, doubt = run_child(None, sorted(nums), by_n, {}, set(), {n: 900.0 for n in nums}, None, 3000.0)
+        v, status, doubt = fork_run(None, sorted(nums), by_n, {}, set(), {n: 900.0 for n in nums}, None, 3000.0)
         after = os.times()
         total = after.children_user + after.children_system - before.children_user - before.children_system
         tsum = 0.0
