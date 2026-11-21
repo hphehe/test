@@ -582,6 +582,21 @@ def breaks_syntax(m, old, new, blocks):
 
 def select(m, patch_text):
     sel = 0
+    # In-place edits of the TPC-H / TPC-DS query files: only the TestExecutor tests whose inputs changed (see
+    # tpc_fixture_model). Without a model every reader of the file is kept, as before.
+    try:
+        fx = tpc_fixture_model(m, patch_text) if any(p in patch_text for p in TPC_FIX) else None
+    except Exception:  # noqa: BLE001  (no model: every reader of the file is kept)
+        fx = None
+    fx_mask = -1
+    if fx is not None:
+        tx = m.d["texec"]
+        fx_mask = ~sum(1 << int(k) for k in tx["ids"]) | fx["keep"] | ((1 << tx["tpcds"]) if fx["px"] else 0)
+
+    def opens(p, in_place):
+        s = m.set(m.d["opens"][p])
+        return s & fx_mask if in_place and p in TPC_FIX else s
+
     for old, new, blocks in parse_patch(patch_text):
         path = old or new
         if path and new and path.endswith(".py") and (new or "").endswith(".py") and \
@@ -608,7 +623,7 @@ def select(m, patch_text):
         # Tests that read the file as data (source parsed as text, fixtures, setup scripts).
         for p in paths:
             if p in m.d["opens"]:
-                sel |= m.set(m.d["opens"][p])
+                sel |= opens(p, old == new)
         if path.startswith("sqlglot/") and path.endswith(".py"):
             if old is None or new is None or new != old:
                 for p in paths:
@@ -631,7 +646,7 @@ def select(m, patch_text):
             if old is None and path.endswith(".py") and not path.endswith("/__init__.py") and inert_module(blocks):
                 continue  # a new test module that only defines things (its tests are not in the list)
             if old is not None and path in m.d["opens"]:
-                sel |= m.set(m.d["opens"][path])
+                sel |= opens(path, old == new)
             if old is None or new is None or (new and new != old):
                 # A file added, removed or renamed in a folder some test reads: those tests may list the folder.
                 for p in paths:
@@ -658,9 +673,90 @@ TPCDS_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 TPCDS_DEPS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/fixtures/optimizer/tpc-ds/",
               "tests/fixtures/optimizer/tpc-h/")
 SQ = os.environ.get("BR_SQ", "/app/sq")  # the pinned sqlglot tree with .pyc, written by --prepare at build time
+TP = os.environ.get("BR_TP", "/app/tp")  # the TPC-DS tables as the test builds them, written by --prepare
 CHECK_JOBS = 2
 CHECK_BUDGET_S = float(os.environ.get("BR_CHECK_BUDGET", 100))  # no check starts after this many seconds of the run
 CHECK_MAX_EST_S = 14  # nor one estimated to cost more CPU seconds than this
+
+
+# ---------------------------------------------------------------- TPC query files
+# tests/fixtures/optimizer/tpc-h/tpc-h.sql and tpc-ds/tpc-ds.sql are read by TestExecutor.setUpClass, so every test of
+# that class (60 tests, 34 s) reads them, and by test_optimizer's test_tpch / test_tpcds. Inside the class only three
+# tests use what was loaded: test_execute_tpch and test_execute_tpcds (each query's meta and sql; queries without
+# `execute` are only parsed and pickled), test_optimized_tpch (tpc-h sql and expected sql). The three share a result
+# cache keyed by the sql text alone. Every other test of the class sees the files only through setUpClass succeeding.
+# So for an in-place edit, replay the loader (tests/helpers.py) on the pinned and the edited text: if it raises,
+# narrow nothing; otherwise keep only the tests whose inputs changed (test_optimizer's readers are always kept).
+TPC_FIX = ("tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+
+
+def fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs with _filter_comments and _extract_meta, as a list, on the text that
+    open(path, encoding="utf-8").read() returns. It raises where they raise."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")  # universal newlines, as a read in text mode does
+    statements = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")]).split(";")
+    size = len(statements)
+    out = []
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql_lines = statements[i].strip().split("\n")
+            meta, j = {}, 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            out.append((meta, "\n".join(sql_lines[j:]), statements[i + 1].strip()))
+    return out
+
+
+def tpc_fixture_model(m, patch_text):
+    """For a change that edits tpc-h.sql or tpc-ds.sql in place: {"keep": mask of the TestExecutor tests that can
+    see the edit, "px": [{i, sql, old}] TPC-DS queries the test only parses and pickles, whose text changed}.
+    None when it cannot narrow: no data in the map, a file added, removed or renamed, a patch that does not apply,
+    undecodable bytes, a loader that raises, or two queries with the same text across the files (shared cache)."""
+    tx = m.d.get("texec")
+    if not tx:
+        return None
+    new = {}
+    for old, new_path, blocks in parse_patch(patch_text):
+        if not ({old, new_path} & set(TPC_FIX)):
+            continue
+        if old != new_path or old in new:
+            return None
+        src = m.source(old)
+        text = patched(src, blocks) if src is not None else None
+        if text is None or "�" in text:
+            return None
+        new[old] = text
+    if not new:
+        return None
+    try:
+        base = {p: fixture_pairs(m.source(p)) for p in TPC_FIX}
+        cur = {p: fixture_pairs(new.get(p, m.source(p))) for p in TPC_FIX}
+    except Exception:  # noqa: BLE001  (setUpClass would fail: every test of the class errors)
+        return None
+    h, ds = TPC_FIX
+    if {s for _, s, _ in cur[h]} & {s for _, s, _ in cur[ds]}:
+        return None
+    keep, px = 0, []
+    if [(mt, s) for mt, s, _ in cur[h]] != [(mt, s) for mt, s, _ in base[h]]:
+        keep |= 1 << tx["tpch"]
+    if [(s, e) for _, s, e in cur[h]] != [(s, e) for _, s, e in base[h]]:
+        keep |= 1 << tx["opt_tpch"]
+    b, c = base[ds], cur[ds]
+    if len(b) != len(c):
+        keep |= 1 << tx["tpcds"]
+    else:
+        for i, ((bm, bs, _), (cm, cs, _)) in enumerate(zip(b, c)):
+            if (bm, bs) == (cm, cs):
+                continue
+            if bm.get("execute") or cm.get("execute"):
+                keep |= 1 << tx["tpcds"]
+                break
+            px.append({"i": i, "sql": cs, "old": bs})
+    if keep >> tx["tpcds"] & 1:
+        px = []
+    return {"keep": keep, "px": px}
 
 
 def fingerprint(e):
@@ -732,9 +828,49 @@ def outer_functions(tree):
     return out
 
 
+def plain_value(n):
+    """An expression whose evaluation at def time has no side effect: a constant, a name, an attribute of a name, a
+    sign or `not` on one of those, or a tuple of them."""
+    if isinstance(n, (ast.Constant, ast.Name)):
+        return True
+    if isinstance(n, ast.Attribute):
+        return plain_value(n.value)
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd, ast.Not)):
+        return plain_value(n.operand)
+    if isinstance(n, ast.Tuple):
+        return all(plain_value(e) for e in n.elts)
+    return False
+
+
+def signature_change(a, b, lazy_annotations):
+    """None when two defs have the same signature; True when only default values (new ones plain) or, in a module
+    whose annotations are never evaluated (PEP 563), annotations differ; False otherwise. Parameter names and kinds
+    must stay: sqlglot reads them (inspect in optimizer.py and executor/env.py), never defaults or annotations."""
+    if ast.dump(a.args) == ast.dump(b.args) and ast.dump(a.returns or ast.Pass()) == ast.dump(b.returns or ast.Pass()):
+        return None
+    x, y = a.args, b.args
+    groups = ("posonlyargs", "args", "kwonlyargs")
+    names = lambda s: [[p.arg for p in getattr(s, g)] for g in groups] + \
+        [s.vararg and s.vararg.arg, s.kwarg and s.kwarg.arg]  # noqa: E731
+    if names(x) != names(y) or len(x.defaults) != len(y.defaults) or \
+            [d is None for d in x.kw_defaults] != [d is None for d in y.kw_defaults]:
+        return False
+    for d0, d1 in zip(x.defaults + x.kw_defaults, y.defaults + y.kw_defaults):
+        if d0 is not None and ast.dump(d0) != ast.dump(d1) and not plain_value(d1):
+            return False
+    ann = lambda s, r: [ast.dump(p.annotation) if p.annotation else "" for g in groups for p in getattr(s, g)] + \
+        [ast.dump(v.annotation) if v and v.annotation else "" for v in (s.vararg, s.kwarg)] + \
+        [ast.dump(r) if r else ""]  # noqa: E731
+    if ann(x, a.returns) != ann(y, b.returns) and not lazy_annotations:
+        return False
+    return True
+
+
 def changed_bodies(old_text, new_text):
     """Old-numbered line spans of the bodies of the functions a change edits, or None when anything outside
-    function bodies differs (defs, decorators, defaults, classes, module or class level statements)."""
+    function bodies differs (defs, decorators, classes, module or class level statements). A def whose only change
+    is in default values or (lazy) annotations counts as an edit of its body: the body is what then behaves
+    differently, wherever it runs."""
     try:
         old_t, new_t = ast.parse(old_text), ast.parse(new_text)
     except (SyntaxError, ValueError):
@@ -742,13 +878,22 @@ def changed_bodies(old_text, new_text):
     of, nf = outer_functions(old_t), outer_functions(new_t)
     if [q for q, _ in of] != [q for q, _ in nf]:
         return None
+    lazy = any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and
+               any(a.name == "annotations" for a in n.names) for n in old_t.body + new_t.body)
     spans = []
     for (_, a), (_, b) in zip(of, nf):
-        if ast.dump(ast.Module(body=a.body, type_ignores=[])) != ast.dump(ast.Module(body=b.body, type_ignores=[])):
+        sig = signature_change(a, b, lazy)
+        if sig is False:
+            return None
+        if sig or ast.dump(ast.Module(body=a.body, type_ignores=[])) != \
+                ast.dump(ast.Module(body=b.body, type_ignores=[])):
             spans.append((a.body[0].lineno, a.end_lineno))
     for t in (old_t, new_t):
         for _, n in outer_functions(t):
             n.body = [ast.Pass()]
+            n.args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None,
+                                   defaults=[])
+            n.returns = None
     if ast.dump(old_t) != ast.dump(new_t):
         return None
     return spans
@@ -767,11 +912,19 @@ def tpcds_job(m, patch_text, tp):
     tq = m.d.get("tpq")
     if not tq:
         return None
-    files, spans = {}, []
+    files, spans, px = {}, [], []
+    fx = None
     for old, new, blocks in parse_patch(patch_text):
         path = old or new
         if not path:
             return None
+        if path in TPC_FIX and old == new:
+            # The query file: the model says whether the test's inputs changed; queries it only parses go in px.
+            fx = fx or tpc_fixture_model(m, patch_text)
+            if fx is None or fx["keep"] >> tp & 1 or m.d["texec"]["tpcds"] != tp:
+                return None
+            px = fx["px"]
+            continue
         if path.startswith("sqlglot/"):
             if not (old and new == old and path.endswith(".py") and path in m.d["files"]):
                 return None
@@ -791,10 +944,10 @@ def tpcds_job(m, patch_text, tp):
                 return None  # the test reads this file
             if old != new or old is None:
                 return None  # a file added, removed or renamed outside sqlglot: the test may list a folder
-    if not files:
+    if not files and not px:
         return None
     lines = tq["lines"]
-    p_m = o_m = g_m = d_m = 0
+    p_m = o_m = g_m = d_m = e_m = 0
     for path, a, b in spans:
         fl = lines.get(path, {})
         for ln in range(a, b + 1):
@@ -806,25 +959,68 @@ def tpcds_job(m, patch_text, tp):
                     # fire on a statement's first line, so its other lines are often missing: that is fine.)
                     return None
                 continue
-            p, o, g, d, x = row
+            p, o, g, d, x, e = row
             if x:
-                return None  # runs at import, in table setup, or after optimize
+                return None  # runs at import or in table setup
             p_m |= p
             o_m |= o
             g_m |= g
             d_m |= d
+            e_m |= e  # runs in the execute stage of these queries: they are executed and their results compared
     ex = tq["exec_mask"]
     q1 = (p_m & ex) | o_m | g_m
     pn = p_m & ~ex
-    if (q1 | d_m) & tq["unstable_mask"] or not (q1 | pn | d_m):
+    if (q1 | d_m) & tq["unstable_mask"] or not (q1 | pn | d_m | e_m | len(px)):
+        return None
+    if e_m and not tables_ready():
         return None
     qs = tq["q"]
-    est = 1.0 + sum(qs[i]["cpu"] for i in range(len(qs)) if (q1 | d_m) >> i & 1)
+    est = 1.0 + 0.05 * len(px) + sum(qs[i]["cpu"] for i in range(len(qs)) if (q1 | d_m) >> i & 1) + \
+        sum(qs[i]["xcpu"] for i in range(len(qs)) if e_m >> i & 1)
     if est > CHECK_MAX_EST_S:
         return None
     pick = lambda mask, keys: [{"i": i, **{k: qs[i][k] for k in keys}} for i in range(len(qs)) if mask >> i & 1]  # noqa: E731
-    return {"files": files, "schema": tq["schema"], "est": est, "q1": pick(q1, ("sql", "fo")),
-            "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck"))}
+    return {"files": files, "schema": tq["schema"], "est": est, "q1": pick(q1, ("sql", "fo", "res", "xcpu")),
+            "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck")), "px": px,
+            "xq": pick(e_m, ("sql", "res", "xcpu")),
+            # CPU left for executing queries whose optimized tree turns out different (only known in the check)
+            "xbudget": round(CHECK_MAX_EST_S - est, 3) if tables_ready() else 0.0}
+
+
+def tables_ready():
+    """The TPC-DS tables --prepare built (and checked against the hashes of the test's own setUpClass tables)."""
+    return os.path.isfile(os.path.join(TP, "ok"))
+
+
+def result_hash(table):
+    """The executed query's result as the test compares it: column names, then every row's values and types."""
+    return hashlib.sha1(repr((list(table.columns), [tuple(r) for r in table.rows])).encode("utf-8", "surrogatepass")
+                        ).hexdigest()
+
+
+def tree_depth(e):
+    """Depth of a sqlglot tree through its args, read from the slots."""
+    from sqlglot.expressions import Expr
+    best, stack = 0, [(e, 1)]
+    while stack:
+        x, d = stack.pop()
+        best = max(best, d)
+        for v in object.__getattribute__(x, "args").values():
+            for c in (v if isinstance(v, list) else [v]):
+                if isinstance(c, Expr):
+                    stack.append((c, d + 1))
+    return best
+
+
+def phase_limit(seconds):
+    """Raise in this process after `seconds` of wall time (replaces any earlier limit)."""
+    import signal
+
+    def stop(*_):
+        raise TimeoutError("check phase over its time limit")
+
+    signal.signal(signal.SIGALRM, stop)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
 
 
 def tpcds_check():
@@ -851,20 +1047,60 @@ def tpcds_check():
         from sqlglot.optimizer import optimize  # noqa: F401
         from sqlglot.planner import Plan  # noqa: F401
         import sqlglot.executor as sx
+        # A change can make the optimizer loop: stop each phase at a few times its estimate (CPU is scored).
+        phase_limit(max(8.0, 3 * job["est"] + 2))
         for q in job["pn"]:
             pickle.loads(pickle.dumps(parse_one(q["sql"])))
+        diffs = []
+        static = {q["i"] for q in job.get("xq", [])}
+        extra = 0.0
         for q in job["q1"]:
             e = pickle.loads(pickle.dumps(parse_one(q["sql"])))
             schema = sx.ensure_schema(copy.deepcopy(job["schema"]), dialect=None)
             o = sx.optimize(e, schema, leave_tables_isolated=True, dialect=None)
             if fingerprint(o) != q["fo"]:
-                print("optimize differs", q["i"])
-                return 1
+                diffs.append(q)  # the executor gets another tree: execute the query and compare its result
+                extra += 0.0 if q["i"] in static else q["xcpu"]
+                if extra > job.get("xbudget", 0.0):  # it cannot be dropped any more: stop spending CPU
+                    print("optimize differs", [x["i"] for x in diffs], f"executing them would cost {extra:.1f} s")
+                    return 1
             o.sql(pretty=True)
         for q in job["d"]:
             if transpile(q["sql"], write="duckdb")[0] != q["duck"]:
                 print("duckdb sql differs", q["i"])
                 return 1
+        for q in job.get("px", []):
+            # A query the test only parses (parent) and pickles to a child that returns None for it: it passes when
+            # both work. The tree may not be deeper than the pinned query's (pickling recurses).
+            a = parse_one(q["sql"])
+            pickle.loads(pickle.dumps(a))
+            if tree_depth(a) > tree_depth(parse_one(q["old"])) + 3:
+                print("parsed query deeper", q["i"])
+                return 1
+        run = {q["i"]: q for q in job.get("xq", []) + diffs}
+        if run:
+            # mp_execute in the test's child: the tables the query names, execute() with the shared schema, the
+            # result pickled back to the parent, which compares it with duckdb's. Same result as at the pinned
+            # commit, where the test passes -> same comparison.
+            if not tables_ready():
+                print("no tables")
+                return 1
+            phase_limit(max(5.0, 3 * sum(q["xcpu"] for q in run.values()) + 2))
+            shared_schema = pickle.loads(pickle.dumps(job["schema"]))
+            cache = {}
+            for q in sorted(run.values(), key=lambda q: q["xcpu"]):
+                expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
+                tables = {}
+                for t in find_tables(expression):
+                    name = t.name
+                    if name not in cache:
+                        with open(os.path.join(TP, name + ".pkl"), "rb") as fh:
+                            cache[name] = pickle.load(fh)
+                    tables[name] = cache[name]
+                table = pickle.loads(pickle.dumps(execute(expression, schema=shared_schema, tables=tables)))
+                if result_hash(table) != q["res"]:
+                    print("result differs", q["i"])
+                    return 1
         print("same")
         return 0
     finally:
@@ -879,7 +1115,8 @@ def run_checks(jobs, t0):
         job = jobs[k]
         try:
             p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--tpcds-check"],
-                               input=json.dumps(job), capture_output=True, text=True, timeout=max(20.0, 4 * job["est"]))
+                               input=json.dumps(job), capture_output=True, text=True,
+                               timeout=max(20.0, 4 * (job["est"] + job.get("xbudget", 0.0))))
         except subprocess.TimeoutExpired:
             print(f"{k}: tpcds check timed out", file=sys.stderr)
             return k, False
@@ -908,6 +1145,51 @@ def prepare(dest):
                 fh.write(m.source(path))
     ok = compileall.compile_dir(os.path.join(dest, "sqlglot"), quiet=1)
     print("prepared", dest, "compiled" if ok else "COMPILE ERRORS")
+    try:
+        build_tables(m, dest, TP)
+    except Exception as exc:  # noqa: BLE001  (no tables: checks that must execute a query keep the test)
+        print("TPC-DS tables not built:", repr(exc))
+
+
+def build_tables(m, dest, out):
+    """Build time: the TPC-DS tables exactly as TestExecutor.setUpClass builds them (python side), from the csv files
+    in the map, with the pinned sqlglot; one pickle per table. Every table must hash as the test's own did, else none
+    is kept."""
+    import ast as pyast
+    import csv
+    import io
+    if "tpcsv" not in m.d:
+        return
+    sys.path.insert(0, dest)
+    from sqlglot.executor.table import Table
+    if not os.path.abspath(sys.modules["sqlglot"].__file__).startswith(os.path.abspath(dest)):
+        raise RuntimeError("wrong sqlglot")
+    os.makedirs(out, exist_ok=True)
+    for table, columns in m.d["tpq"]["schema"].items():
+        raw = base64.b64decode(m.d["tpcsv"][table])
+        if raw[:2] != b"\x1f\x8b":
+            raise RuntimeError(f"{table}: not gzip")
+        reader = csv.reader(gzip.open(io.BytesIO(raw), "rt", newline=""), delimiter="|")  # open_file in the test
+        rows = []
+        ctypes = []
+        next(reader)
+        for row in reader:
+            if not ctypes:
+                for i, v in enumerate(row):
+                    try:
+                        ctypes.append(type(pyast.literal_eval(v)))
+                    except (ValueError, SyntaxError):
+                        ctypes.append(str)
+            rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+        t = pickle.loads(pickle.dumps(Table(columns=columns, rows=rows)))  # the initializer receives them pickled
+        h = hashlib.sha1(repr((list(t.columns), t.rows)).encode("utf-8", "surrogatepass")).hexdigest()
+        if h != m.d["tphash"][table]:
+            raise RuntimeError(f"{table}: built table differs from the test's")
+        with open(os.path.join(out, table + ".pkl"), "wb") as fh:
+            pickle.dump(t, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    with open(os.path.join(out, "ok"), "w") as fh:
+        fh.write("ok\n")
+    print("built", len(m.d["tpq"]["schema"]), "TPC-DS tables in", out)
 
 
 def pack(tests, ms):
@@ -935,6 +1217,12 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
     m = Map(MAP)
+    tx = m.d.get("texec")
+    if tx:  # the narrowing names tests by number: only when this run numbers them as the map does
+        ids = {str(t["number"]): t["id"] for t in tests}
+        if any(ids.get(k) != v for k, v in tx["ids"].items()) or \
+                sum(1 for v in ids.values() if v.startswith("tests/test_executor.py::")) != len(tx["ids"]):
+            m.d["texec"] = None
     rows, jobs = [], {}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="replace")
