@@ -1225,6 +1225,35 @@ SNAP_SKIP_MOD = {"__file__", "__cached__", "__spec__", "__loader__", "__builtins
                  "__package__", "__doc__"}
 
 
+def skey(k):
+    """A text for a dict key or set member that is the same in every process, and the same for keys that are equal
+    as dict keys (1, 1.0 and True; a str enum member and its text). Keys of other kinds fall into one text per type:
+    unequal keys may then share a text, which only widens what reads it."""
+    import enum
+    if isinstance(k, str):
+        return "s:" + str.__str__(k)
+    if k is None:
+        return "N"
+    if isinstance(k, (bool, int)):
+        return "i:%d" % int(k)
+    if isinstance(k, float):
+        return "i:%d" % int(k) if k.is_integer() else "f:" + repr(k)
+    if isinstance(k, tuple):
+        return "(" + ",".join(skey(x) for x in k) + ")"
+    if isinstance(k, frozenset):
+        return "{" + ",".join(sorted(skey(x) for x in k)) + "}"
+    if isinstance(k, enum.Enum):
+        t = type(k)
+        return f"E:{t.__module__}.{t.__qualname__}.{k.name}"
+    if isinstance(k, type):
+        return f"C:{k.__module__}.{k.__qualname__}"
+    t = type(k)
+    return f"T:{getattr(t, '__module__', '?')}.{getattr(t, '__qualname__', '?')}"
+
+
+TABLE_TYPES = (dict, set, frozenset)
+
+
 def snap_state(root, bag_keys=()):
     """Child process: import every sqlglot module from root with unittest loaded (sqlglot's UNITTEST flag, as under
     pytest) and fingerprint the state. ({key: [hash, tag, module, qualname]}, {key: bag hash}, stats)."""
@@ -1356,13 +1385,30 @@ def snap_state(root, bag_keys=()):
             return "F"
         return "V"
 
-    keys, bags, done = {}, {}, set()
+    keys, bags, done, ents = {}, {}, set(), {}
     bag_keys = set(bag_keys)
 
     def put(key, value, t, mod, qual):
         keys[key] = [h(fp(value, 0, frozenset(), False)), t, mod, qual]
         if key in bag_keys:
             bags[key] = h(fp(value, 0, frozenset(), True))
+        if type(value) in TABLE_TYPES:
+            # Entry by entry, so that a diff can name the keys that changed (values order-free where the holder's
+            # value differs from run to run).
+            per, order = {}, []
+            for k in value:
+                v = value[k] if type(value) is dict else True
+                try:
+                    sk = skey(k)
+                except Exception:  # noqa: BLE001
+                    sk = "?"
+                order.append(sk)
+                per.setdefault(sk, []).append(fp(v, 0, frozenset(), key in bag_keys))
+            e = {sk: h("|".join(sorted(x))) for sk, x in per.items()}
+            e["#n"] = str(len(value))
+            if type(value) is dict and key not in bag_keys:
+                e["#order"] = h("\x00".join(order))
+            ents[key] = e
 
     def do_class(c, path, mod, qual):
         if id(c) in done:
@@ -1400,6 +1446,7 @@ def snap_state(root, bag_keys=()):
         keys["IMPORTERROR:" + n] = [h(e), "E", n, ""]
     stats["modules"] = len([n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")])
     stats["errors"] = len(errs)
+    stats["ents"] = ents
     return keys, bags, stats
 
 
@@ -1445,11 +1492,17 @@ def build_state_base(root, dest):
         never = sorted(k for k in unstable if b1["bags"].get(k) != b2["bags"].get(k))
         if any(r["stats"]["deep"] for r in runs):
             raise RuntimeError(f"pinned state not comparable: {runs[0]['stats']}")
+        ents = b1["stats"].pop("ents", {})
+        # entries that differ between the two bag runs can never be compared entry by entry
+        e2 = b2["stats"].pop("ents", {})
+        ent_never = sorted(k for k in ents if ents[k] != e2.get(k))
+        for r in runs:
+            r["stats"].pop("ents", None)
         with open(dest, "w") as fh:
             json.dump({"keys": base, "unstable": unstable, "bags": b1["bags"], "never": never,
-                       "stats": runs[0]["stats"]}, fh)
+                       "stats": runs[0]["stats"], "ents": ents, "ent_never": ent_never}, fh)
         print("state base:", len(base), "keys,", len(unstable), "unstable,", len(never), "never comparable,",
-              runs[0]["stats"])
+              len(ents), "tables,", len(ent_never), "tables not comparable by entry,", runs[0]["stats"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1493,6 +1546,222 @@ def state_diff(tmp):
         elif a != b:
             diffs.append((k, a, b))
     return diffs
+
+
+def state_key_diff(tmp):
+    """state_diff, plus for each changed dict / set holder the keys whose entries differ ("#n" when its size differs,
+    "#order" when its keys or their order do). (diffs, {holder: set of keys} or None for a holder that cannot be compared by entry), or
+    a string saying why the trees cannot be compared."""
+    if not os.path.isfile(SD):
+        return "no state base"
+    with open(SD) as fh:
+        base = json.load(fh)
+    if "ents" not in base:
+        return "no entry base"
+    out = os.path.join(tmp, "snap.json")
+    try:
+        new = snap_run(tmp, out, base["unstable"])
+    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        return f"snapshot failed: {exc!r}"
+    nents = new["stats"].pop("ents", {})
+    if new["stats"].get("deep") or new["stats"].get("opaque") != base["stats"].get("opaque"):
+        return f"snapshot not comparable: {new['stats']} vs {base['stats']}"
+    unstable, never, ent_never = set(base["unstable"]), set(base["never"]), set(base.get("ent_never", ()))
+    diffs, by_key = [], {}
+    for k in sorted(set(base["keys"]) | set(new["keys"])):
+        a, b = base["keys"].get(k), new["keys"].get(k)
+        if k in never:
+            return f"never comparable: {k}"
+        if k in unstable:
+            changed = a is None or b is None or base["bags"].get(k) != new["bags"].get(k) or a[1:] != b[1:]
+        else:
+            changed = a != b
+        if not changed:
+            continue
+        diffs.append((k, a, b))
+        ea, eb = base["ents"].get(k), nents.get(k)
+        if ea is None or eb is None or k in ent_never:
+            by_key[k] = None
+            continue
+        ch = {sk for sk in set(ea) | set(eb) if ea.get(sk) != eb.get(sk)}
+        if set(ea) - {"#n", "#order"} != set(eb) - {"#n", "#order"}:
+            ch.add("#order")
+        by_key[k] = ch
+    return diffs, by_key
+
+
+KEY_BUDGET_S = float(os.environ.get("BR_KEY_BUDGET", 60))  # no key check starts after this many seconds
+KEY_MIN_S = 6.0  # a key check runs only where the chosen tests cost this many simulated seconds (below, the runs
+# settle a commit for less CPU than the check)
+LAZY_PKGS = ("sqlglot.dialects", "sqlglot.optimizer")  # packages whose __getattr__ imports and caches names
+DIALECT_TABLE = "sqlglot.dialects.dialect._Dialect._classes"  # dialect name -> class; a lookup of a name not there imports
+
+
+def values_only(old_text, new_text):
+    """True when a change edits only the values of NAME = ... and NAME: T = ... statements in module and class bodies
+    (also inside module-level if / try / with blocks), None when the code is the same (comments, blank lines),
+    False otherwise."""
+    try:
+        a, b = ast.parse(old_text), ast.parse(new_text)
+    except (SyntaxError, ValueError):
+        return False
+    if ast.dump(a) == ast.dump(b):
+        return None
+
+    def blank(body):
+        for st in body:
+            if isinstance(st, ast.Assign) and all(isinstance(x, ast.Name) for x in st.targets):
+                st.value = ast.Constant(None)
+            elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                st.value = ast.Constant(None)
+            elif isinstance(st, ast.ClassDef):
+                blank(st.body)
+            elif isinstance(st, ast.If):
+                blank(st.body)
+                blank(st.orelse)
+            elif isinstance(st, (ast.Try, ast.With)):
+                for f in ("body", "orelse", "finalbody"):
+                    blank(getattr(st, f, []))
+                for hd in getattr(st, "handlers", []):
+                    blank(hd.body)
+    blank(a.body)
+    blank(b.body)
+    return ast.dump(a) == ast.dump(b)
+
+
+def key_job(m, text):
+    """{"files": {path: patched text}, "data": [paths]} for a change that edits values of assignments in sqlglot
+    modules, besides comments there and .sql fixtures (whose readers stay), or None."""
+    files, data, real = {}, [], False
+    for old, new, blocks in parse_patch(text):
+        if not old or new != old:
+            return None
+        if old.startswith("sqlglot/") and old.endswith(".py"):
+            if old not in m.d["files"]:
+                return None
+            src = m.source(old)
+            nt = patched(src, blocks) if src is not None else None
+            v = values_only(src, nt) if nt is not None else False
+            if v is False:
+                return None
+            real = real or v
+            files[old] = nt
+        elif old.startswith("tests/fixtures/") and old.endswith(".sql"):
+            data.append(old)
+        else:
+            return None
+    return {"files": files, "data": data} if real else None
+
+
+def key_check():
+    """Child process: stdin is {path: patched text}. Prints the changed holders and, per dict / set holder, the
+    changed keys, as JSON."""
+    files = json.loads(sys.stdin.read())["files"]
+    sys.dont_write_bytecode = True
+    tmp = patched_tree(files)
+    try:
+        r = state_key_diff(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if isinstance(r, str):
+        print(json.dumps({"why": r}))
+        return 0
+    diffs, by_key = r
+    print(json.dumps({"diffs": [[k, (b or a)[2], b is None, a, b] for k, a, b in diffs],
+                      "by_key": {k: (None if v is None else sorted(v)) for k, v in by_key.items()}}))
+    return 0
+
+
+def key_readers(m, diffs, by_key):
+    """The tests that read an entry the change touched (also its size or key order where those changed), the tests
+    the map could not follow, or a string saying why the change cannot be narrowed."""
+    km = m.d["keys"]
+    cache = km.setdefault("_r", {})
+    keep = set(km["u"])
+
+    def table(tid):
+        r = cache.get(tid)
+        if r is None:
+            r = cache[tid] = json.loads(km["t"][str(tid)])
+        return r
+    if any(k.startswith("IMPORTERROR") and gone for k, _, gone, _, _ in diffs):
+        return "a module that failed to import now imports"
+    # Modules that no longer import: every test that imports one (an import statement or importlib, at the test
+    # module's import or while it runs) or looks its dialect up by name, which imports the module.
+    failed = {mod for k, mod, gone, _, _ in diffs if k.startswith("IMPORTERROR")}
+    # A class defined elsewhere that the walk reached through a failed module is now named by another path: the
+    # same record under a new key is the same, unchanged value.
+    def tail(k):  # the attribute part of a key (records name the path's module and class, not the owner's)
+        return "::" + k.rsplit("::", 1)[1] if "::" in k else k.rsplit(".", 1)[-1].rsplit(":", 1)[-1]
+    gone_recs = {(tail(k), a[0], a[1]) for k, _, gone, a, _ in diffs if gone and a is not None}
+    dialects = set()
+    if failed:
+        imp = km.get("_imp")
+        if imp is None:
+            imp = km["_imp"] = json.loads(km["imp"])
+        for name, ns in imp.items():
+            if any(name == f or name.startswith(f + ".") for f in failed):
+                keep.update(ns)
+        reg = km["h"].get(DIALECT_TABLE)
+        for f in failed:
+            parts = f.split(".")
+            if len(parts) == 3 and parts[:2] == ["sqlglot", "dialects"]:
+                if reg is None:
+                    return "no dialect registry"
+                dialects.add("s:" + parts[2])
+                r = table(reg)
+                for sk in ("s:" + parts[2], "#w", "#k", "#l", "#m"):
+                    keep.update(r.get(sk, ()))
+    for k, mod, gone, a, b in diffs:
+        if k.startswith("IMPORTERROR") or mod in failed:
+            continue  # the module's own state went with it
+        if failed and gone and any(k.startswith(f + ".") or k.startswith(f + ":") or k.replace(":", ".", 1) == f
+                                   for f in failed):
+            continue  # reached only through a failed module, or the package's name for it: its users are in
+        if k.endswith("::order") and k[: -len("::order")] == mod:
+            continue  # the order of a module's globals (names added, moved or gone): nothing reads it at run time
+        if failed and a is None and (tail(k), b[0], b[1]) in gone_recs:
+            continue
+        pkg, _, name = k.partition(":")
+        if failed and pkg in LAZY_PKGS and (a is None or b is None) and (a or b)[1].startswith("G") and                 "." not in name and ":" not in name:
+            continue  # a lazily cached package attribute (the package's __getattr__ gives it either way)
+        ch, tid = by_key.get(k), km["h"].get(k)
+        ch = None if ch is None else set(ch)
+        if k == DIALECT_TABLE and ch is not None and not ch - dialects - {"#n", "#order"}:
+            continue  # only the failed dialects are missing: their users are in
+        if ch is None and tid is not None and not gone:
+            r = table(tid)
+            if "#v" in r:  # a class constant: the tests that read it
+                keep.update(r["#v"])
+                continue
+        if ch is None or tid is None:
+            return f"not a followed table: {k}"
+        if tid in km["no"]:
+            return f"table read where its uses cannot be seen: {k}"
+        r = table(tid)
+        if "#m" in r or "?" in r or "?" in ch:
+            return f"table written at run time or with unnamed keys: {k}"
+        keep.update(r.get("#w", ()))
+        for sk in ch:
+            keep.update(r.get({"#n": "#l", "#order": "#k"}.get(sk, sk), ()))
+    return keep
+
+
+def run_key_checks(jobs, t0):
+    """{commit: the key check's answer (dict), or None}. Two at a time (each holds a tree copy and a snapshot, ~16 MB
+    of the 64 MB /tmp); none starts after the budget."""
+    def one(k):
+        if time.time() - t0 > KEY_BUDGET_S:
+            return k, None
+        try:
+            p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--key-check"],
+                               input=json.dumps(jobs[k]), capture_output=True, text=True, timeout=60)
+            return k, json.loads(p.stdout.strip().splitlines()[-1])
+        except Exception as exc:  # noqa: BLE001
+            print(f"{k}: key check: {exc!r}", file=sys.stderr)
+            return k, None
+    with ThreadPoolExecutor(2) as ex:
+        return dict(ex.map(one, sorted(jobs)))
 
 
 def nonbody_only(old_text, new_text):
@@ -2994,6 +3263,60 @@ def main():
     os._exit(0)  # no interpreter teardown (it only costs CPU)
 
 
+def key_phase(m, tests, ms, rows, out):
+    """Narrow the commits that only change values of assignments to the tests that read a changed entry. Returns the
+    commits where a module no longer imports: every test left uses it, so runs here would only see failures."""
+    km = m.d.get("keys")
+    no_run = set()
+    if not km:
+        return no_run
+    ids = "\n".join(t["id"] for t in sorted(tests, key=lambda t: t["number"]))
+    if hashlib.sha1(ids.encode()).hexdigest() != km.get("ids") or not os.path.isfile(SD):
+        return no_run  # the map names tests by number: only when this run numbers them alike
+    if not isinstance(km["no"], set):
+        km["no"] = set(km["no"])
+
+    def cost(ts):
+        if not ts:
+            return 0.0
+        w = pack(ts, ms)
+        return (max(sum(ms[t] for t in x) for x in w) + WORKER_MS * len(w)) / 1000
+    jobs = {}
+    for stem, chosen, text in rows:
+        if cost(chosen) < KEY_MIN_S:
+            continue
+        try:
+            files = key_job(m, text)
+        except Exception as exc:  # noqa: BLE001
+            print(f"{stem}: key job: {exc!r}", file=sys.stderr)
+            files = None
+        if files:
+            jobs[stem] = files
+    _log(f"key checks: {len(jobs)}")
+    if not jobs:
+        return no_run
+    res = run_key_checks(jobs, time.time())
+    for stem, r in res.items():
+        if not r or "why" in r:
+            print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
+            continue
+        keep = key_readers(m, r["diffs"], r["by_key"])
+        if isinstance(keep, str):
+            print(f"{stem}: key check keeps all: {keep}", file=sys.stderr)
+            continue
+        for path in list(jobs[stem]["files"]) + jobs[stem]["data"]:
+            sid = m.d["opens"].get(path)
+            if sid is not None:
+                mask = m.set(sid)
+                keep.update(n for n in out[stem] if mask >> n & 1)
+        before = len(out[stem])
+        out[stem] = [n for n in out[stem] if n in keep]
+        if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
+            no_run.add(stem)
+        print(f"{stem}: key check keeps {len(out[stem])} of {before} ({len(r['diffs'])} changed)", file=sys.stderr)
+    return no_run
+
+
 def select_all(t_start):
     t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
@@ -3037,9 +3360,16 @@ def select_all(t_start):
                 jobs[patch.stem] = job
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
+    no_run = set()
+    try:
+        no_run = key_phase(m, tests, ms, rows, out)
+    except Exception as exc:  # noqa: BLE001  (no narrowing)
+        print(f"key checks: {exc!r}", file=sys.stderr)
+    _log(f"phase keys: {sum(os.times()[:4]):.2f} s CPU")
     try:
         passed, tp_ok = runner_phase(m, {t["number"]: t for t in tests}, ms,
-                                     [(stem, out[stem], text) for stem, _, text in rows if out[stem]], t_start, tp)
+                                     [(stem, out[stem], text) for stem, _, text in rows if out[stem] and stem not in no_run],
+                                     t_start, tp)
     except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
         print(f"runner: {exc!r}", file=sys.stderr)
         passed, tp_ok = {}, set()
@@ -3047,7 +3377,7 @@ def select_all(t_start):
     for stem, ok in passed.items():
         out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
     # The proof checks only where the runs left test_execute_tpcds in
-    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ())}
+    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run}
     try:
         dropped = run_checks(jobs, time.time())
     except Exception as exc:  # noqa: BLE001
@@ -3067,6 +3397,8 @@ if __name__ == "__main__":
         sys.exit(tpcds_check())
     elif sys.argv[1:2] == ["--cls-check"]:
         sys.exit(cls_check())
+    elif sys.argv[1:2] == ["--key-check"]:
+        sys.exit(key_check())
     elif sys.argv[1:2] == ["--snap"]:
         sys.exit(snap_main(sys.argv[2:5]))
     elif sys.argv[1:2] == ["--measure"]:
