@@ -1109,6 +1109,13 @@ def patched_tree(files):
     for path, text in files.items():
         with open(os.path.join(tmp, path), "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
+        # A .pyc that is not checked against its source (unchecked-hash) would still load the pinned code.
+        d, base = os.path.split(os.path.join(tmp, path))
+        cache = os.path.join(d, "__pycache__")
+        if os.path.isdir(cache):
+            for f in os.listdir(cache):
+                if f.startswith(base[:-3] + ".") and f.endswith(".pyc"):
+                    os.remove(os.path.join(cache, f))
     return tmp
 
 
@@ -1869,10 +1876,65 @@ def run_checks(jobs, t0):
         return dict(ex.map(one, sorted(jobs, key=lambda k: jobs[k]["est"])))
 
 
+def fetch_tree(m, dest):
+    """Build time: the whole pinned tree (GitHub archive of the pinned commit) at dest, for the test runs. Every
+    sqlglot/ and tests/ Python file must equal the map's source, and the map must know every one of them."""
+    import io
+    import tarfile
+    import urllib.request
+    url = f"https://github.com/tobymao/sqlglot/archive/{PIN}.tar.gz"
+    data = None
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as r:
+                data = r.read()
+            break
+        except Exception as exc:  # noqa: BLE001
+            print(f"download attempt {attempt + 1}: {exc!r}")
+            time.sleep(3 * (attempt + 1))
+    if data is None:
+        raise RuntimeError("no archive")
+    prefix = f"sqlglot-{PIN}/"
+    tmp = dest + ".part"
+    shutil.rmtree(tmp, ignore_errors=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        members = []
+        for mem in tf.getmembers():
+            if mem.name.rstrip("/") + "/" == prefix:
+                continue
+            if not mem.name.startswith(prefix):
+                raise RuntimeError(f"unexpected member {mem.name}")
+            mem.name = mem.name[len(prefix):]
+            members.append(mem)
+        tf.extractall(tmp, members=members, filter="data")
+    for path in m.d["src"]:
+        with open(os.path.join(tmp, path), encoding="utf-8", newline="") as fh:
+            if fh.read() != m.source(path):
+                raise RuntimeError(f"{path} differs from the map")
+    for top in ("sqlglot", "tests"):
+        for root, _, names in os.walk(os.path.join(tmp, top)):
+            for f in names:
+                rel = os.path.relpath(os.path.join(root, f), tmp).replace(os.sep, "/")
+                if f.endswith(".py") and rel not in m.d["src"]:
+                    raise RuntimeError(f"{rel} is not in the map")
+    os.rename(tmp, dest)
+    print("pinned tree at", dest)
+
+
 def prepare(dest):
     """Build time: write the pinned sqlglot tree from the map and compile it, for the checks."""
     import compileall
     m = Map(MAP)
+    try:
+        fetch_tree(m, ST)
+    except Exception as exc:  # noqa: BLE001  (no tree: no test runs, the selection as v11)
+        print("pinned tree not fetched:", repr(exc))
+        shutil.rmtree(ST, ignore_errors=True)
+        shutil.rmtree(ST + ".part", ignore_errors=True)
+    p = subprocess.run([sys.executable, "-c", "import duckdb, numpy, pandas, dateutil, pytz"], capture_output=True)
+    if p.returncode != 0 and os.path.isdir(ST):  # the test modules would not import: no test runs
+        print("test libraries missing:", p.stderr[-300:])
+        shutil.rmtree(ST, ignore_errors=True)
     for path, b in m.d["src"].items():
         if path.startswith("sqlglot/"):
             p = os.path.join(dest, path)
@@ -1934,6 +1996,815 @@ def build_tables(m, dest, out):
     print("built", len(m.d["tpq"]["schema"]), "TPC-DS tables in", out)
 
 
+# ---------------------------------------------------------------- test runs
+# The v11 selection gives the candidates. The cheap candidates of a commit then run here, on the patched code, in a
+# forked child of one warm process; a candidate that passes there is left out, one that fails, is not reached, or
+# ran in any doubt stays.
+# hot:  only function bodies of sqlglot modules change (module and class level code compiles the same): the child
+#        puts the new code objects into the live functions. A guard: a test whose traces run a changed statement but
+#        that never entered a changed function here is not trusted.
+# fresh: any other change of sqlglot/ or tests/ Python: the child drops the loaded sqlglot and tests modules and
+#        imports the patched tree from memory.
+# Fixture edits reach the tests through open(). Tests that use other processes run their pool tasks in-process
+# (InlinePool). Long tests, tests that read changed files by other means, and tests that do not pass here on the
+# pinned tree (map "run" field) never run here.
+
+ST = os.environ.get("BR_ST", "/app/st")  # the whole pinned tree (sqlglot, tests, fixtures), written by --prepare
+PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+RUN_DEADLINE_S = float(os.environ.get("BR_RUN_WALL", 150))  # no child runs past this many seconds of the run
+HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, HOLD_FACTOR * (2 s + its recorded seconds))
+HOLD_FACTOR = 0.7
+HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of test runs per commit
+FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
+FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
+AFTER_FAIL = 0.5  # once a test failed, a test runs only when it costs less than this share of its recorded seconds
+LONG_S = 15.0  # never run here: test_execute_tpcds (it has its own proof) and test_max_nodes
+TEST_WALL_S = 4.0  # wall seconds a test may take: max(this, 25 x its cost)
+SETUP_WALL_S = 12.0  # wall seconds between tests (imports, class fixtures)
+NO_RUN_FILES = ("tests/test_dialect_entry_points.py", "tests/test_sqlglotc.py")
+NO_RUN_IDS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}  # runs python in a subprocess
+RUN_DEBUG = os.environ.get("BR_RUN_DEBUG")
+CO_OPTIMIZED = 0x1
+
+
+def _log(*a):
+    if RUN_DEBUG:
+        print(*a, file=sys.stderr, flush=True)
+
+
+def same_const(x, y):
+    return type(x) is type(y) and repr(x) == repr(y)
+
+
+def code_same(x, y):
+    """Same behaviour: everything but line numbers (nested code compared the same way)."""
+    if (x.co_code != y.co_code or x.co_names != y.co_names or x.co_varnames != y.co_varnames
+            or x.co_freevars != y.co_freevars or x.co_cellvars != y.co_cellvars or x.co_flags != y.co_flags
+            or x.co_argcount != y.co_argcount or x.co_kwonlyargcount != y.co_kwonlyargcount
+            or x.co_posonlyargcount != y.co_posonlyargcount or x.co_exceptiontable != y.co_exceptiontable
+            or x.co_qualname != y.co_qualname or len(x.co_consts) != len(y.co_consts)):
+        return False
+    for a, b in zip(x.co_consts, y.co_consts):
+        ca, cb = hasattr(a, "co_code"), hasattr(b, "co_code")
+        if ca != cb or (ca and not code_same(a, b)) or (not ca and not same_const(a, b)):
+            return False
+    return True
+
+
+def deftime_equal(a, b, pairs):
+    """Module or class body code that does the same; the function code found on the way goes to pairs."""
+    if (a.co_code != b.co_code or a.co_names != b.co_names or a.co_varnames != b.co_varnames
+            or a.co_exceptiontable != b.co_exceptiontable or a.co_flags != b.co_flags
+            or len(a.co_consts) != len(b.co_consts)):
+        return False
+    for x, y in zip(a.co_consts, b.co_consts):
+        cx, cy = hasattr(x, "co_code"), hasattr(y, "co_code")
+        if cx != cy:
+            return False
+        if cx:
+            if (x.co_flags & CO_OPTIMIZED) != (y.co_flags & CO_OPTIMIZED):
+                return False
+            if x.co_flags & CO_OPTIMIZED:
+                if x.co_qualname != y.co_qualname or x.co_freevars != y.co_freevars or x.co_name != y.co_name:
+                    return False
+                pairs.append((x, y))
+            elif not deftime_equal(x, y, pairs):
+                return False
+        elif not same_const(x, y):
+            return False
+    return True
+
+
+def changed_pairs(pairs):
+    """The pairs whose code differs, nested ones included; None when a swap cannot reproduce the patched module
+    (a changed docstring: __doc__ is set when the function is made; nested functions of another shape)."""
+    out, stack = [], list(pairs)
+    while stack:
+        x, y = stack.pop()
+        if code_same(x, y):
+            continue
+        if x.co_consts[:1] != y.co_consts[:1] and any(isinstance(c, str) for c in x.co_consts[:1] + y.co_consts[:1]):
+            return None
+        out.append((x, y))
+        xc = [c for c in x.co_consts if hasattr(c, "co_code")]
+        yc = [c for c in y.co_consts if hasattr(c, "co_code")]
+        if len(xc) != len(yc) or any(a.co_qualname != b.co_qualname or a.co_freevars != b.co_freevars
+                                     or a.co_name != b.co_name for a, b in zip(xc, yc)):
+            return None
+        stack.extend(zip(xc, yc))
+    return out
+
+
+def run_plan(m, text):
+    """How a child can reproduce the patched tree: {"mode": "hot" or "fresh", "files": {path: new text, or None
+    when deleted}, "pairs": [(old code, new code)], "removed": {path: [old changed lines]}}, or None."""
+    import marshal
+    if "\\ No newline" in text:
+        return None
+    files, removed = {}, {}
+    for old, new, blocks in parse_patch(text):
+        path = old or new
+        if not path or (old and new and old != new) or path in files:
+            return None
+        if not path.startswith(("sqlglot/", "tests/")) or path.rsplit("/", 1)[-1] == "conftest.py":
+            return None
+        if path.endswith(".py"):
+            if old is None:
+                t = "\n".join(x for b in blocks for x in b[1]) + "\n"
+            elif new is None:
+                t = None
+            else:
+                src = m.source(path)
+                t = patched(src, blocks) if src is not None else None
+                if t is None:
+                    return None
+        else:
+            if old is None or new is None or not path.startswith("tests/fixtures/"):
+                return None
+            try:
+                with open(os.path.join(ST, path), encoding="utf-8", newline="") as fh:
+                    src = fh.read()
+            except (OSError, UnicodeDecodeError):
+                return None
+            if "\r" in src:
+                return None
+            t = patched(src, blocks)
+            if t is None:
+                return None
+        files[path] = t
+        removed[path] = [ln for b in blocks for ln, _ in b[0]]
+    if not files:
+        return None
+    plan = {"mode": "hot", "files": files, "pairs": [], "removed": removed}
+    for path, t in files.items():
+        if not path.endswith(".py"):
+            continue
+        src = m.source(path) if path.startswith("sqlglot/") else None
+        if src is None or t is None:
+            plan["mode"] = "fresh"
+            continue
+        fn = os.path.join(ST, path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                a = compile(src, fn, "exec", dont_inherit=True)
+                b = marshal.loads(marshal.dumps(compile(t, fn, "exec", dont_inherit=True)))  # as from a .pyc
+            except (SyntaxError, ValueError):
+                return None
+        got = []
+        ch = changed_pairs(got) if deftime_equal(a, b, got) else None
+        if ch is None:
+            plan["mode"] = "fresh"
+        else:
+            plan["pairs"] += ch
+    if plan["mode"] == "fresh":
+        plan["pairs"] = []
+    return plan
+
+
+class _MemLoader:
+    def __init__(self, path, text):
+        self.path, self.text = path, text
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        import marshal
+        code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
+        exec(marshal.loads(marshal.dumps(code)), module.__dict__)  # constants as a .pyc gives them
+
+    def get_source(self, name):
+        return self.text
+
+    def get_filename(self, name):
+        return self.path
+
+
+class _Overlay:
+    """Meta path finder: patched or added sqlglot and tests modules from memory; deleted ones raise."""
+
+    def __init__(self, files):
+        self.files = files
+
+    def find_spec(self, name, path=None, target=None):
+        import importlib.util
+        if name.partition(".")[0] not in ("sqlglot", "tests"):
+            return None
+        rel = name.replace(".", "/")
+        for cand, pkg in ((rel + "/__init__.py", True), (rel + ".py", False)):
+            if cand in self.files:
+                if self.files[cand] is None:
+                    raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+                full = os.path.join(ST, cand)
+                return importlib.util.spec_from_file_location(
+                    name, full, loader=_MemLoader(full, self.files[cand]),
+                    submodule_search_locations=[os.path.dirname(full)] if pkg else None)
+            if os.path.exists(os.path.join(ST, cand)):
+                return None
+        return None
+
+
+def install_open_overlay(files):
+    """open() (builtins, io) gives the patched text of the changed files; a deleted one is not found."""
+    import builtins
+    import io
+    table = {os.path.join(ST, rel): t for rel, t in files.items()}
+    real_open, real_open_code = builtins.open, io.open_code
+
+    def key_of(file):
+        if isinstance(file, (str, os.PathLike)):
+            try:
+                return os.path.abspath(os.fspath(file))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def opener(file, mode="r", *args, **kwargs):
+        k = key_of(file)
+        if k is not None and k in table and not any(c in mode for c in "wax+"):
+            t = table[k]
+            if t is None:
+                raise FileNotFoundError(2, "No such file or directory", str(file))
+            data = io.BytesIO(t.encode("utf-8", "surrogateescape"))
+            if "b" in mode:
+                return data
+            return io.TextIOWrapper(data, encoding=kwargs.get("encoding", args[1] if len(args) > 1 else None),
+                                    errors=kwargs.get("errors", args[2] if len(args) > 2 else None),
+                                    newline=kwargs.get("newline", args[3] if len(args) > 3 else None))
+        return real_open(file, mode, *args, **kwargs)
+
+    def open_code(path):
+        k = key_of(path)
+        if k is not None and k in table:
+            if table[k] is None:
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+            return io.BytesIO(table[k].encode("utf-8", "surrogateescape"))
+        return real_open_code(path)
+
+    builtins.open = opener
+    io.open = opener
+    io.open_code = open_code
+
+
+def install_inline_pool():
+    """concurrent.futures.ProcessPoolExecutor runs each task in this process when its result is asked for, with what
+    a test can observe of a real pool: arguments and results through pickle, the task's exception from result(), and
+    a pool whose worker would have died broken for every later task. Before the test modules import it."""
+    import concurrent.futures as cf
+
+    def broken():
+        from concurrent.futures.process import BrokenProcessPool
+        return BrokenProcessPool("A process in the process pool was terminated abruptly")
+
+    class InlineFuture(cf.Future):
+        def __init__(self, pool, fn, args, kwargs):
+            super().__init__()
+            self._br = (pool, fn, args, kwargs)
+            self._state = "FINISHED"
+
+        def _compute(self):
+            if self._br is None:
+                return
+            pool, fn, args, kwargs = self._br
+            self._br = None
+            if pool._broken or not pool._start():
+                self._exception = broken()
+                return
+            try:
+                payload = pickle.dumps((fn, args, kwargs))
+            except BaseException as e:  # noqa: BLE001  (the real pool reports it on the future)
+                self._exception = e
+                return
+            try:
+                fn, args, kwargs = pickle.loads(payload)
+                value = fn(*args, **kwargs)
+            except SystemExit:
+                pool._broken = True
+                self._exception = broken()
+                return
+            except BaseException as e:  # noqa: BLE001
+                if isinstance(e, KeyboardInterrupt):
+                    raise
+                self._exception = e
+                return
+            try:
+                self._result = pickle.loads(pickle.dumps(value))
+            except BaseException as e:  # noqa: BLE001
+                self._exception = e
+
+        def result(self, timeout=None):
+            self._compute()
+            if self._exception is not None:
+                raise self._exception
+            return self._result
+
+        def exception(self, timeout=None):
+            self._compute()
+            return self._exception
+
+        def cancel(self):
+            return False
+
+    class InlinePool:
+        def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+            self._init = (initializer, initargs)
+            self._started = self._broken = self._shutdown = False
+
+        def _start(self):
+            if self._started:
+                return not self._broken
+            self._started = True
+            fn, args = self._init
+            if fn is not None:
+                try:
+                    fn(*args)
+                except BaseException as e:  # noqa: BLE001
+                    if isinstance(e, KeyboardInterrupt):
+                        raise
+                    self._broken = True
+                    return False
+            return True
+
+        def submit(self, fn, /, *args, **kwargs):
+            if self._broken:
+                raise broken()
+            if self._shutdown:
+                raise RuntimeError("cannot schedule new futures after shutdown")
+            return InlineFuture(self, fn, args, kwargs)
+
+        def map(self, fn, *iterables, timeout=None, chunksize=1):
+            fs = [self.submit(fn, *a) for a in zip(*iterables)]
+            return (f.result() for f in fs)
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            self._shutdown = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.shutdown()
+            return False
+
+    cf.ProcessPoolExecutor = InlinePool
+
+
+def function_index():
+    """Live functions of the sqlglot tree by (file, first line, name)."""
+    import gc
+    import types
+    root = os.path.join(ST, "sqlglot", "")
+    idx = {}
+    for o in gc.get_objects():
+        if type(o) is types.FunctionType:
+            c = o.__code__
+            if c.co_filename.startswith(root):
+                idx.setdefault((c.co_filename, c.co_firstlineno, c.co_name), []).append(o)
+    return idx
+
+
+def all_codes(c):
+    out = [c]
+    for k in c.co_consts:
+        if hasattr(k, "co_code"):
+            out += all_codes(k)
+    return out
+
+
+def child_run(plan, order, tests, wfd, idx, skip_after):
+    """In the forked child: reproduce the patched tree, run `order` (test numbers, in run order), report lines
+    "S n" (started), "V n code reached cpu_us" (code 0 pass, 1 fail, 2 not run or skipped), "X why" (doubt about
+    the whole run), "END"."""
+    import functools
+    import importlib
+    import unittest
+
+    def put(s):
+        os.write(wfd, (s + "\n").encode())
+
+    try:
+        dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(dn, 1)
+        if not RUN_DEBUG:
+            os.dup2(dn, 2)
+        files = plan["files"] if plan else {}
+        codes = []
+        if plan and plan["mode"] == "fresh":
+            for name in [k for k in sys.modules if k.partition(".")[0] in ("sqlglot", "tests")]:
+                del sys.modules[name]
+        elif plan:
+            for x, y in plan["pairs"]:
+                found = idx.get((x.co_filename, x.co_firstlineno, x.co_name), [])
+                live = [f for f in found if f.__code__ == x]
+                if len(live) != len(found):
+                    put("X a live function there has other code")
+                    os._exit(0)
+                for f in live:
+                    f.__code__ = y
+            for x, y in plan["pairs"]:
+                codes += all_codes(y)
+        py = {p: t for p, t in files.items() if p.endswith(".py")}
+        if py:
+            sys.meta_path.insert(0, _Overlay(py))
+            importlib.invalidate_caches()
+        if files:
+            install_open_overlay(files)
+        cur = [None, False]
+        mon = sys.monitoring
+        if codes:
+            mon.use_tool_id(mon.PROFILER_ID, "br-guard")
+
+            def on_start(code, offset):
+                cur[1] = True
+                return mon.DISABLE
+
+            mon.register_callback(mon.PROFILER_ID, mon.events.PY_START, on_start)
+            for c in {id(c): c for c in codes}.values():
+                mon.set_local_events(mon.PROFILER_ID, c, mon.events.PY_START)
+        failed_import = {}
+        any_failed = [False]
+        suite = unittest.TestSuite()
+        for n in order:
+            path, cls_name, meth = tests[n]["id"].split("::")
+            name = path[:-3].replace("/", ".")
+            try:
+                if name in failed_import:
+                    raise failed_import[name]
+                try:
+                    mod = importlib.import_module(name)
+                except Exception as e:  # noqa: BLE001
+                    failed_import[name] = e
+                    raise
+                case = getattr(mod, cls_name)(meth)
+            except Exception:  # noqa: BLE001  (the module does not import, or the test is gone)
+                put(f"V {n} 1 0 0")
+                any_failed[0] = True
+                continue
+            case._br_n = n
+            if n in skip_after:
+                real = getattr(case, meth)
+
+                def method(*a, _real=real, _case=case, **k):
+                    if any_failed[0]:
+                        _case._br_skip = True
+                        raise unittest.SkipTest("after a failure")
+                    return _real(*a, **k)
+
+                setattr(case, meth, functools.wraps(real)(method))
+            suite.addTest(case)
+        if plan and plan["mode"] == "fresh":
+            import gc
+            gc.freeze()
+
+        class Verdicts(unittest.TestResult):
+            def __init__(self):
+                super().__init__()
+                self.failfast = True  # a failing subtest ends its test (TestCase.subTest reads it)
+                self._b, self._skip, self._t = 0, False, 0.0
+
+            def stop(self):  # failfast must not end the whole run
+                pass
+
+            def _exc_info_to_string(self, err, test):  # only pass or fail counts: no traceback formatting
+                return ""
+
+            def _bad(self):
+                return len(self.failures) + len(self.errors) + len(self.unexpectedSuccesses)
+
+            def startTest(self, test):
+                super().startTest(test)
+                self._b, self._skip = self._bad(), False
+                cur[0], cur[1] = test._br_n, False
+                if codes:
+                    mon.restart_events()
+                put(f"S {test._br_n}")
+                self._t = time.process_time()
+
+            def addSkip(self, test, reason):
+                super().addSkip(test, reason)
+                self._skip = True
+
+            def addError(self, test, err):
+                super().addError(test, err)
+                if not hasattr(test, "_br_n"):  # a class or module fixture failed
+                    put("X fixture error")
+
+            def stopTest(self, test):
+                super().stopTest(test)
+                n = test._br_n
+                code = 1 if self._bad() > self._b else (2 if self._skip else 0)
+                if code == 1:
+                    any_failed[0] = True
+                put(f"V {n} {code} {int(cur[1])} {int((time.process_time() - self._t) * 1e6)}")
+                cur[0] = None
+
+        suite.run(Verdicts())
+        put("END")
+    except BaseException as e:  # noqa: BLE001
+        try:
+            put("X " + repr(e)[:200].replace("\n", " "))
+        except OSError:
+            pass
+    finally:
+        os._exit(0)
+
+
+def run_child(plan, order, tests, idx, skip_after, allowed, cap, time_left):
+    """Fork, run, collect. ({n: (code, reached, cpu)}, status END / TIMEOUT / DIED, doubt or None)."""
+    import select
+    import signal
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
+        child_run(plan, order, tests, w, idx, skip_after)
+        os._exit(0)
+    os.close(w)
+    verdicts, status, doubt = {}, "DIED", None
+    now = time.monotonic()
+    t_end, t_next, t_cap = now + time_left, now + SETUP_WALL_S, None
+    buf = b""
+    try:
+        while True:
+            now = time.monotonic()
+            lim = min(t_end, t_next, t_cap or t_end)
+            if now >= lim:
+                status = "TIMEOUT"
+                break
+            ready, _, _ = select.select([r], [], [], lim - now)
+            if not ready:
+                continue
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                s = line.decode("utf-8", "replace")
+                if s == "END":
+                    status = "END"
+                elif s.startswith("X"):
+                    doubt = doubt or s
+                elif s.startswith("S "):
+                    n = int(s[2:])
+                    if t_cap is None and cap:
+                        t_cap = time.monotonic() + cap
+                    t_next = time.monotonic() + allowed.get(n, TEST_WALL_S)
+                elif s.startswith("V "):
+                    _, n, code, reached, us = s.split()
+                    verdicts[int(n)] = (int(code), reached == "1", int(us) / 1e6)
+                    t_next = time.monotonic() + SETUP_WALL_S
+    finally:
+        os.close(r)
+        for kill in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+            try:
+                kill()
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        os.waitpid(pid, 0)
+        try:
+            while os.waitpid(-1, os.WNOHANG)[0] > 0:  # anything a test started (PID 1 in the container)
+                pass
+        except ChildProcessError:
+            pass
+    return verdicts, status, doubt
+
+
+def sim_cost(ts, ms):
+    if not ts:
+        return 0.0
+    w = pack(list(ts), ms)
+    return (max(sum(ms[t] for t in x) for x in w) + WORKER_MS * len(w)) / 1000
+
+
+def run_choice(m, plan, cands, tests, ms, info):
+    """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate), or None
+    when the runs cannot save more than they cost."""
+    cpu, cls_cpu, bad = info.get("cpu", {}), info.get("cls", {}), set(info.get("bad", ()))
+    readers = 0
+    for p in plan["files"]:
+        # .py files are read through open(), io.open (pathlib) or the import system, all served the patched text
+        # (linecache keeps the pinned lines, which only traceback text shows); .sql fixtures through open(). Other
+        # files may be read where the overlay does not reach (duckdb reads the csv files itself): readers stay.
+        if p in m.d["opens"] and not (p.endswith(".py") or (p.startswith("tests/fixtures/") and p.endswith(".sql"))):
+            readers |= m.set(m.d["opens"][p])
+
+    def cost(n):
+        c = cpu.get(tests[n]["id"])
+        return c if c is not None else 1.5 * ms[n] / 1000 + 0.01
+
+    run = []
+    for n in cands:
+        tid, rec = tests[n]["id"], ms[n] / 1000
+        if (tid in bad or tid in NO_RUN_IDS or tid.startswith(NO_RUN_FILES) or tid.count("::") != 2
+                or rec > LONG_S or readers >> n & 1):
+            continue
+        if cost(n) <= max(HOLD_FLOOR_S, HOLD_FACTOR * (WORKER_MS / 1000 + rec)):
+            run.append(n)
+    budget = HOT_BUDGET_S if plan["mode"] == "hot" else FRESH_BUDGET_S
+    if sum(cost(n) for n in run) > budget:
+        keep, acc = set(), 0.0
+        for n in sorted(run, key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002)):
+            if acc + cost(n) <= budget:
+                acc += cost(n)
+                keep.add(n)
+        run = [n for n in run if n in keep]
+    if not run:
+        return None
+    classes = {tests[n]["id"].rsplit("::", 1)[0] for n in run}
+    spend = sum(cost(n) for n in run) + sum(cls_cpu.get(c, 0.0) for c in classes)
+    spend += info.get("imp", FRESH_IMPORT_S) if plan["mode"] == "fresh" else 0.02
+    rest = [n for n in cands if n not in set(run)]
+    if sim_cost(cands, ms) - sim_cost(rest, ms) <= spend:
+        return None  # even if every run passes, the answer shrinks by less than the runs cost
+    run.sort()
+    skip_after = {n for n in run if cost(n) > max(0.03, AFTER_FAIL * ms[n] / 1000)}
+    allowed = {n: max(TEST_WALL_S, 25 * cost(n)) for n in run}
+    cap = 2.0 + 3.0 * spend + max(allowed.values())
+    return run, skip_after, allowed, cap, spend
+
+
+def expected_callers(m, plan):
+    """Tests whose traces ran a changed statement of a hot commit's sqlglot modules that the parent has loaded."""
+    exp_mask = 0
+    for x, _ in plan["pairs"]:
+        rel = os.path.relpath(x.co_filename, ST).replace(os.sep, "/")
+        mod = rel[:-3].replace("/", ".").removesuffix(".__init__")
+        if mod not in sys.modules or rel not in m.d["files"]:
+            continue
+        lines = {ln for c in all_codes(x) for _, _, ln in c.co_lines() if ln is not None}
+        last = max(lines)
+        for ln in plan["removed"].get(rel, ()):
+            if x.co_firstlineno < ln <= last:
+                sp = line_span(m, rel, ln)
+                if sp and x.co_firstlineno < sp[0] and sp[1] <= last:
+                    exp_mask |= sp[2]
+    return exp_mask
+
+
+def runner_phase(m, tests, ms, work, t_start):
+    """work: [(commit, candidates, patch text)]. Returns {commit: tests that passed here}."""
+    import gc
+    info = m.d.get("run") or {}
+    if not os.path.isdir(os.path.join(ST, "sqlglot")) or not hasattr(os, "fork") or not info.get("cpu"):
+        return {}
+    jobs = []
+    for c, cands, text in work:
+        try:
+            plan = run_plan(m, text)
+            ch = run_choice(m, plan, cands, tests, ms, info) if plan else None
+        except Exception as exc:  # noqa: BLE001
+            _log(c, "plan:", repr(exc))
+            continue
+        if ch is not None:
+            jobs.append([c, cands, plan, ch])
+    if not jobs:
+        return {}
+    for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    os.chdir(ST)
+    sys.path.insert(0, ST)
+    install_inline_pool()
+    # The parent imports the test modules of every run once (sqlglot with them), watching whether a changed
+    # function starts or a changed file is opened meanwhile: such a hot commit becomes fresh.
+    watch = {}
+    for j in jobs:
+        for x, _ in j[2]["pairs"]:
+            watch.setdefault((x.co_filename, x.co_firstlineno, x.co_name), set()).add(j[0])
+    hit, opened = set(), set()
+    mon = sys.monitoring
+    mon.use_tool_id(mon.COVERAGE_ID, "br-watch")
+
+    def on_start(code, offset):
+        k = (code.co_filename, code.co_firstlineno, code.co_name)
+        if k in watch:
+            hit.update(watch[k])
+        return mon.DISABLE
+
+    def audit(event, args):
+        if event == "open" and args and isinstance(args[0], str):
+            opened.add(os.path.abspath(args[0]))
+
+    mon.register_callback(mon.COVERAGE_ID, mon.events.PY_START, on_start)
+    mon.set_events(mon.COVERAGE_ID, mon.events.PY_START)
+    auditing = [True]
+    sys.addaudithook(lambda e, a: audit(e, a) if auditing[0] else None)
+    mods = sorted({tests[n]["id"].split("::")[0][:-3].replace("/", ".") for j in jobs for n in j[3][0]})
+    t_imp = time.process_time()
+    for name in mods:
+        try:
+            __import__(name)
+        except BaseException as exc:  # noqa: BLE001  (its tests fail in the child too, and stay)
+            _log("import", name, repr(exc)[:120])
+    auditing[0] = False
+    mon.set_events(mon.COVERAGE_ID, 0)
+    mon.register_callback(mon.COVERAGE_ID, mon.events.PY_START, None)
+    mon.free_tool_id(mon.COVERAGE_ID)
+    mon.restart_events()
+    _log(f"parent import {time.process_time() - t_imp:.2f} s CPU, {len(mods)} test modules")
+    for j in jobs:
+        plan = j[2]
+        if plan["mode"] == "hot" and (j[0] in hit or any(os.path.join(ST, p) in opened for p in plan["files"]
+                                                         if not p.endswith(".py"))):
+            plan["mode"], plan["pairs"] = "fresh", []
+            j[3] = run_choice(m, plan, j[1], tests, ms, info)
+    jobs = [j for j in jobs if j[3] is not None]
+    idx = function_index()
+    gc.freeze()
+    out = {}
+    jobs.sort(key=lambda j: j[3][4])
+    for c, cands, plan, (run, skip_after, allowed, cap, spend) in jobs:
+        left = t_start + RUN_DEADLINE_S - time.monotonic()
+        if left < 5.0:
+            break
+        try:
+            exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
+            before = os.times()
+            verdicts, status, doubt = run_child(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0)
+            after = os.times()
+            used = after.children_user + after.children_system - before.children_user - before.children_system
+        except Exception as exc:  # noqa: BLE001
+            _log(c, "run:", repr(exc))
+            continue
+        if doubt:
+            _log(c, plan["mode"], "doubt:", doubt)
+            continue
+        passed = {n for n, (code, reached, _) in verdicts.items()
+                  if code == 0 and (reached or not exp_mask >> n & 1)}
+        out[c] = passed
+        _log(f"{c} {plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} pass {len(passed)} "
+             f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}")
+    return out
+
+
+def measure_main(out_path):
+    """Dev, in the image: every test class runs on the pinned tree in a child, as the runs do. Writes the map's "run"
+    field: per-test CPU, per-class setup CPU, the tests that do not pass here, the CPU of a fresh import."""
+    import gc
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    by_n = {t["number"]: t for t in tests}
+    for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    os.chdir(ST)
+    sys.path.insert(0, ST)
+    install_inline_pool()
+    by_class = {}
+    for t in tests:
+        if t["id"].count("::") == 2:
+            by_class.setdefault(t["id"].rsplit("::", 1)[0], []).append(t["number"])
+    mods = sorted({c.split("::")[0][:-3].replace("/", ".") for c in by_class})
+    t0 = time.process_time()
+    for name in mods:
+        try:
+            __import__(name)
+        except BaseException as exc:  # noqa: BLE001
+            print("import", name, repr(exc)[:200], file=sys.stderr)
+    print(f"parent import {time.process_time() - t0:.2f} s", file=sys.stderr)
+    gc.freeze()
+    cpu, cls, bad = {}, {}, []
+    for c, nums in sorted(by_class.items()):
+        before = os.times()
+        v, status, doubt = run_child(None, sorted(nums), by_n, {}, set(), {n: 900.0 for n in nums}, None, 3000.0)
+        after = os.times()
+        total = after.children_user + after.children_system - before.children_user - before.children_system
+        tsum = 0.0
+        for n in nums:
+            tid = by_n[n]["id"]
+            if n in v:
+                cpu[tid] = round(v[n][2], 4)
+                tsum += v[n][2]
+            if n not in v or v[n][0] != 0 or doubt:
+                bad.append(tid)
+        cls[c] = round(max(0.0, total - tsum), 4)
+        print(f"{c}: {len(v)}/{len(nums)} {status} {doubt or ''} total {total:.2f} tests {tsum:.2f} "
+              f"bad {sum(1 for n in nums if by_n[n]['id'] in bad)}", file=sys.stderr, flush=True)
+    imps = []
+    for _ in range(3):
+        r, w = os.pipe()
+        before = os.times()
+        pid = os.fork()
+        if pid == 0:
+            for name in [k for k in sys.modules if k.partition(".")[0] in ("sqlglot", "tests")]:
+                del sys.modules[name]
+            import importlib
+            importlib.import_module("tests.test_transpile")
+            os._exit(0)
+        os.close(w)
+        os.close(r)
+        os.waitpid(pid, 0)
+        after = os.times()
+        imps.append(after.children_user + after.children_system - before.children_user - before.children_system)
+    out = {"cpu": cpu, "cls": cls, "bad": sorted(bad), "imp": round(sorted(imps)[1], 3)}
+    with open(out_path, "w") as fh:
+        json.dump(out, fh)
+    print(f"measured {len(cpu)} tests, {len(bad)} bad, fresh import {out['imp']} s", file=sys.stderr)
+
+
 def pack(tests, ms):
     """The cheapest split: for 1..8 workers, longest test first onto the lightest worker."""
     if not tests:
@@ -1954,6 +2825,41 @@ def pack(tests, ms):
 
 
 def main():
+    # Only the answers may reach stdout: they go to a copy of it, and fd 1 becomes stderr for everything else.
+    ans_fd = os.dup(1)
+    os.dup2(2, 1)
+    t_start = time.monotonic()
+    out = {}
+    order = []
+    try:
+        order, out = select_all(t_start)
+    except BaseException as exc:  # noqa: BLE001  (never crash a run)
+        print(f"selector failed: {exc!r}", file=sys.stderr)
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    if not order:
+        order = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
+    lines = []
+    for stem in order:
+        chosen = out.get(stem)
+        if chosen is None:
+            chosen = list(ms)
+        lines.append(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
+    data = ("\n".join(lines) + "\n").encode() if lines else b""
+    while data:
+        data = data[os.write(ans_fd, data):]
+    cg = ""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as fh:
+            cg = fh.readline().strip()
+    except OSError:
+        pass
+    print(f"done: {time.monotonic() - t_start:.1f} s wall, {sum(os.times()[:4]):.2f} s CPU {cg}", file=sys.stderr)
+    sys.stderr.flush()
+    os._exit(0)  # no interpreter teardown (it only costs CPU)
+
+
+def select_all(t_start):
     t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
@@ -1974,7 +2880,7 @@ def main():
             print(f"{patch.stem}: {exc!r}", file=sys.stderr)
             mask = m.all_tests()
         chosen = [n for n in ms if mask >> n & 1]
-        rows.append((patch.stem, chosen))
+        rows.append((patch.stem, chosen, text))
         if tp is not None and mask >> tp & 1:
             try:
                 job = tpcds_job(m, text, tp)
@@ -1994,15 +2900,26 @@ def main():
                     job = None
             if job is not None:
                 jobs[patch.stem] = job
+    _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     try:
         dropped = run_checks(jobs, t0)
     except Exception as exc:  # noqa: BLE001
         print(f"tpcds checks: {exc!r}", file=sys.stderr)
         dropped = {}
-    for stem, chosen in rows:
-        if dropped.get(stem):
-            chosen = [n for n in chosen if n != tp]
-        print(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
+    _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU")
+    out = {}
+    for stem, chosen, _ in rows:
+        out[stem] = [n for n in chosen if n != tp] if dropped.get(stem) else chosen
+    try:
+        passed = runner_phase(m, {t["number"]: t for t in tests}, ms,
+                              [(stem, out[stem], text) for stem, _, text in rows if out[stem]], t_start)
+    except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
+        print(f"runner: {exc!r}", file=sys.stderr)
+        passed = {}
+    _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU")
+    for stem, ok in passed.items():
+        out[stem] = [n for n in out[stem] if n not in ok]
+    return [stem for stem, _, _ in rows], out
 
 
 if __name__ == "__main__":
@@ -2014,5 +2931,7 @@ if __name__ == "__main__":
         sys.exit(cls_check())
     elif sys.argv[1:2] == ["--snap"]:
         sys.exit(snap_main(sys.argv[2:5]))
+    elif sys.argv[1:2] == ["--measure"]:
+        measure_main(sys.argv[2])
     else:
         main()
