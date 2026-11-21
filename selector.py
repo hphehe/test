@@ -8,6 +8,8 @@ import os
 import re
 import sys
 import textwrap
+import warnings
+import zlib
 from bisect import bisect_right
 from pathlib import Path
 
@@ -173,6 +175,19 @@ class Map:
             self._blocks[key] = json.loads(self.d["files"][path].get("cmp", "{}"))
         return self._blocks[key]
 
+    def swap_sets(self, path):
+        """{"line:col": {"j": sid}}: at that comparison, the tests in which CMP_OPS[j] gave a different result than
+        the operator written (or could not be checked) at least once; recorded test by test, each in its own process."""
+        key = (path, "cmpt")
+        if key not in self._blocks:
+            self._blocks[key] = json.loads(self.d["files"][path].get("cmpt", "{}"))
+        return self._blocks[key]
+
+    def source(self, path):
+        """The pinned commit's text of a sqlglot/ or tests/ Python file, or None."""
+        b = self.d.get("src", {}).get(path)
+        return zlib.decompress(base64.b64decode(b)).decode("utf-8") if b is not None else None
+
     def set(self, sid):
         s = self._sets.get(sid)
         if s is None:
@@ -286,6 +301,32 @@ def same_everywhere(m, path, removed, added):
     return swapped
 
 
+def swap_tests(m, path, removed, added):
+    """When every changed line only swaps one comparison operator for another: the tests in which the new operator
+    gave a different result at that comparison at least once (0 if it agreed everywhere). A test outside them
+    evaluates every changed comparison the same way, so it runs exactly as before. None when some line is not such a
+    swap or the swap has no per-test record (the caller prices the block as before)."""
+    if not removed or len(removed) != len(added):
+        return None
+    agree, per_test = m.same_results(path), m.swap_sets(path)
+    sel, swapped = 0, False
+    for (x, old), new in zip(removed, added):
+        if old == new:
+            continue
+        sw = operator_swap(old, new)
+        if sw is None:
+            return None
+        swapped = True
+        key = f"{x}:{sw[0]}"
+        if agree.get(key, 0) >> sw[1] & 1:
+            continue
+        sid = per_test.get(key, {}).get(str(sw[1]))
+        if sid is None:
+            return None
+        sel |= m.set(sid)
+    return sel if swapped else None
+
+
 def land(m, path, at, col, clause):
     """Tests that can reach code put before old line `at` at indentation `col`, or None when that code would run at
     load time (module or class level) or cannot be placed. `clause`: the code opens an else/except/... clause."""
@@ -376,7 +417,9 @@ def select_sqlglot(m, path, blocks):
         # Only comments or blank lines, none inside a multi-line string: nothing runs differently.
         if all(is_comment_or_blank(t) for t in texts) and not in_string:
             continue
-        if same_everywhere(m, path, removed, added):
+        got = swap_tests(m, path, removed, added)
+        if got is not None:
+            sel |= got  # 0 when every swap agreed in every test
             continue
         got = header_change(m, path, removed, added)
         if got is not None:
@@ -492,9 +535,52 @@ def folder_readers(m, path):
     return sel
 
 
+def patched(text, blocks):
+    """`text` with the blocks applied, or None when a removed line does not match (the patch is for other text)."""
+    lines = text.split("\n")
+    out, i = [], 1  # i: the next old line to copy
+    for removed, added, at in blocks:
+        start = removed[0][0] if removed else at
+        if start < i:
+            return None
+        out += lines[i - 1:start - 1]
+        for ln, t in removed:
+            if ln > len(lines) or lines[ln - 1].rstrip("\r") != t.rstrip("\r"):
+                return None
+        out += added
+        i = removed[-1][0] + 1 if removed else start
+    return "\n".join(out + lines[i - 1:])
+
+
+def breaks_syntax(m, old, new, blocks):
+    """True when the changed Python file no longer compiles. Python is the run's version (the image pins 3.13)."""
+    if old is None:
+        text = "\n".join(t for b in blocks for t in b[1]) + "\n"  # a new file is all added lines
+    else:
+        src = m.source(old)
+        text = patched(src, blocks) if src is not None else None
+        if text is None:
+            return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            compile(text, new or old, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return True
+        except Exception:  # noqa: BLE001  (recursion and memory limits of a huge expression: not our concern)
+            return False
+    return False
+
+
 def select(m, patch_text):
     sel = 0
     for old, new, blocks in parse_patch(patch_text):
+        path = old or new
+        if path and new and path.endswith(".py") and (new or "").endswith(".py") and \
+                path.startswith(("sqlglot/", "tests/")) and breaks_syntax(m, old, new, blocks):
+            # A module that no longer compiles fails every test that imports it, and a test file that does not
+            # compile stops collection (pytest's default interrupts the whole run): run everything.
+            return m.all_tests()
         path = old or new
         if not path:
             continue
