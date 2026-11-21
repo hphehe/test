@@ -164,8 +164,17 @@ class Blocks:
 
 class Map:
     def __init__(self, path):
-        with gzip.open(path, "rb") as fh:
-            self.d = json.loads(fh.read())
+        self.d = None
+        pk = str(path) + ".pkl"  # written by --prepare: the same map, read ~5x faster
+        try:
+            if os.path.getmtime(pk) >= os.path.getmtime(path):
+                with open(pk, "rb") as fh:
+                    self.d = pickle.load(fh)
+        except Exception:  # noqa: BLE001
+            self.d = None
+        if not isinstance(self.d, dict):
+            with gzip.open(path, "rb") as fh:
+                self.d = json.loads(fh.read())
         self.n = self.d["n_tests"]
         self._sets = {}
         self._spans = {}
@@ -1103,8 +1112,10 @@ def phase_limit(seconds):
     signal.setitimer(signal.ITIMER_REAL, seconds)
 
 
-def patched_tree(files):
-    """A temporary copy of the pinned tree with these files replaced. The caller removes it."""
+def patched_tree(files, pyc=False):
+    """A temporary copy of the pinned tree with these files replaced. The caller removes it. With pyc, each replaced
+    file also gets a .pyc, so that it loads as the pinned files do (a set constant read back from a .pyc can iterate
+    in another order than the one the compiler built)."""
     tmp = tempfile.mkdtemp(prefix="tpc")
     shutil.copytree(os.path.join(SQ, "sqlglot"), os.path.join(tmp, "sqlglot"))  # copy2: the .pyc stay valid
     for path, text in files.items():
@@ -1117,6 +1128,13 @@ def patched_tree(files):
             for f in os.listdir(cache):
                 if f.startswith(base[:-3] + ".") and f.endswith(".pyc"):
                     os.remove(os.path.join(cache, f))
+        if pyc and path.endswith(".py"):
+            import py_compile
+            try:
+                py_compile.compile(os.path.join(tmp, path), doraise=True,
+                                   invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+            except Exception:  # noqa: BLE001  (the import then compiles it, and reports the error)
+                pass
     return tmp
 
 
@@ -1254,7 +1272,7 @@ def skey(k):
 TABLE_TYPES = (dict, set, frozenset)
 
 
-def snap_state(root, bag_keys=(), want_ents=None):
+def snap_state(root, bag_keys=(), want_ents=None, roots=None, errs=None):
     """Child process: import every sqlglot module from root with unittest loaded (sqlglot's UNITTEST flag, as under
     pytest) and fingerprint the state. ({key: [hash, tag, module, qualname]}, {key: bag hash}, stats)."""
     import enum
@@ -1269,22 +1287,37 @@ def snap_state(root, bag_keys=(), want_ents=None):
     import sqlglot
     if not os.path.abspath(sqlglot.__file__).startswith(os.path.abspath(root)):
         raise RuntimeError("wrong sqlglot " + sqlglot.__file__)
-    errs = {}
-    for name in sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.", onerror=lambda n: None)):
-        try:
-            importlib.import_module(name)
-        except BaseException as exc:  # noqa: BLE001
-            errs[name] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    if errs is None:  # else the caller imported everything (the warm key check)
+        errs = {}
+        for name in sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.", onerror=lambda n: None)):
+            try:
+                importlib.import_module(name)
+            except BaseException as exc:  # noqa: BLE001
+                errs[name] = f"{type(exc).__name__}: {str(exc)[:200]}"
     gc.collect()
     stats = {"opaque": 0, "deep": 0}
+    cur, okeys = [None], set()  # the key being printed; keys whose value holds an object known only by its repr
     addr = re.compile(r" at 0x[0-9a-fA-F]+")
     memo = {}
 
+    names = {}  # id(class) -> (class, its name text, its reference text): the same text every time it is asked
+
     def qn(t):
-        return f"{getattr(t, '__module__', '?')}.{getattr(t, '__qualname__', getattr(t, '__name__', '?'))}"
+        hit = names.get(id(t))
+        if hit is not None and hit[0] is t:
+            return hit[1]
+        q = f"{getattr(t, '__module__', '?')}.{getattr(t, '__qualname__', getattr(t, '__name__', '?'))}"
+        if isinstance(t, type):
+            names[id(t)] = (t, q, None)
+        return q
 
     def cls_ref(o):
-        return f"T:{qn(o)}<{','.join(qn(b) for b in o.__bases__)}>"
+        hit = names.get(id(o))
+        if hit is not None and hit[0] is o and hit[2] is not None:
+            return hit[2]
+        ref = f"T:{qn(o)}<{','.join(qn(b) for b in o.__bases__)}>"
+        names[id(o)] = (o, qn(o), ref)
+        return ref
 
     def code_fp(c):
         consts = ",".join(code_fp(x) if isinstance(x, types.CodeType) else fp(x, 0, frozenset(), False)
@@ -1298,7 +1331,12 @@ def snap_state(root, bag_keys=(), want_ents=None):
         if o is None or t in (bool, int, float, complex, str, bytes):
             return repr(o)
         if isinstance(o, enum.Enum):
-            return f"E:{qn(t)}.{o.name}=" + fp(o._value_, d + 1, stack, bag)
+            hit = memo.get((id(o), bag))
+            if hit is not None and hit[0] is o:
+                return hit[1]
+            out = f"E:{qn(t)}.{o.name}=" + fp(o._value_, d + 1, stack, bag)
+            memo[(id(o), bag)] = (o, out)
+            return out
         if isinstance(o, type):
             return cls_ref(o)
         if isinstance(o, types.ModuleType):
@@ -1370,6 +1408,7 @@ def snap_state(root, bag_keys=(), want_ents=None):
                 rep = repr(o)
                 if addr.search(rep):
                     stats["opaque"] += 1
+                    okeys.add(cur[0])
                 parts.append(addr.sub("", rep))
             out = "".join(parts)
         memo[(id(o), bag)] = (o, out)
@@ -1389,6 +1428,7 @@ def snap_state(root, bag_keys=(), want_ents=None):
     bag_keys = set(bag_keys)
 
     def put(key, value, t, mod, qual):
+        cur[0] = key
         keys[key] = [h(fp(value, 0, frozenset(), False)), t, mod, qual]
         if key in bag_keys:
             bags[key] = h(fp(value, 0, frozenset(), True))
@@ -1411,13 +1451,14 @@ def snap_state(root, bag_keys=(), want_ents=None):
                 e["#order"] = h("\x00".join(order))
             ents[key] = e
 
-    def do_class(c, path, mod, qual):
+    def do_class(c, path, mod, qual, inroot=True):
         if id(c) in done:
             return
         done.add(id(c))
-        keys[path + "::bases"] = [h(",".join(cls_ref(b) for b in c.__bases__)), "S", mod, qual]
-        keys[path + "::meta"] = [h(qn(type(c))), "S", mod, qual]
-        keys[path + "::order"] = [h(",".join(k for k in c.__dict__ if k not in SNAP_SKIP_CLASS)), "S", mod, qual]
+        if inroot:
+            keys[path + "::bases"] = [h(",".join(cls_ref(b) for b in c.__bases__)), "S", mod, qual]
+            keys[path + "::meta"] = [h(qn(type(c))), "S", mod, qual]
+            keys[path + "::order"] = [h(",".join(k for k in c.__dict__ if k not in SNAP_SKIP_CLASS)), "S", mod, qual]
         # Entries carry the class's own module and qualname (what the map's class table is keyed by), not the path
         # the walk reached it through (a per-dialect class made with type() is reached as Dialect.tokenizer_class).
         cmod, cqual = getattr(c, "__module__", "") or "", getattr(c, "__qualname__", "") or ""
@@ -1425,20 +1466,26 @@ def snap_state(root, bag_keys=(), want_ents=None):
             if k in SNAP_SKIP_CLASS:
                 continue
             if isinstance(v, type) and v.__module__.startswith("sqlglot"):
-                keys[f"{path}.{k}"] = [h(cls_ref(v)), "T", cmod, cqual]
-                do_class(v, f"{path}.{k}", mod, f"{qual}.{k}")
-            else:
+                if inroot:
+                    keys[f"{path}.{k}"] = [h(cls_ref(v)), "T", cmod, cqual]
+                do_class(v, f"{path}.{k}", mod, f"{qual}.{k}", inroot)
+            elif inroot or f"{path}.{k}" == DIALECT_TABLE:
                 put(f"{path}.{k}", v, tag(v), cmod, cqual)
 
     for n, mo in sorted((n, mo) for n, mo in sys.modules.items() if n == "sqlglot" or n.startswith("sqlglot.")):
         dct = vars(mo)
-        keys[n + "::order"] = [h(",".join(k for k in dct if k not in SNAP_SKIP_MOD)), "S", n, ""]
+        inroot = roots is None or n in roots
+        if inroot:
+            keys[n + "::order"] = [h(",".join(k for k in dct if k not in SNAP_SKIP_MOD)), "S", n, ""]
         for k, v in dct.items():
             if k in SNAP_SKIP_MOD:
                 continue
             if isinstance(v, type) and v.__module__ == n and v.__qualname__ == k:
-                keys[f"{n}:{k}"] = [h(cls_ref(v)), "GT", n, ""]
-                do_class(v, f"{n}.{k}", n, k)
+                if inroot:
+                    keys[f"{n}:{k}"] = [h(cls_ref(v)), "GT", n, ""]
+                do_class(v, f"{n}.{k}", n, k, inroot)
+            elif not inroot:
+                continue
             elif isinstance(v, types.ModuleType):
                 put(f"{n}:{k}", v, "GM", n, "")
             else:
@@ -1448,7 +1495,199 @@ def snap_state(root, bag_keys=(), want_ents=None):
     stats["modules"] = len([n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")])
     stats["errors"] = len(errs)
     stats["ents"] = ents
+    stats["okeys"] = sorted(okeys)
     return keys, bags, stats
+
+
+def graph_main(argv):
+    """--graph ROOT OUT: which sqlglot modules each sqlglot module imports while it loads (import statements,
+    importlib, parents of what it imports), and which modules change objects outside their own namespace while they
+    load (an augmented assignment to an item or attribute, a mutating call on a name the same body did not make, an
+    item or attribute assignment, setattr): the warm key check re-imports only a changed module and its importers,
+    which is exact only when nothing loading changes what it did not make."""
+    import builtins
+    import importlib
+    import importlib.util
+    import pkgutil
+    import unittest  # noqa: F401
+    root, out = argv
+    sys.setrecursionlimit(20000)
+    sys.path.insert(0, root)
+    edges = {}
+    real_import, real_im = builtins.__import__, importlib.import_module
+    # an edge goes from the module whose top-level code is running (the innermost module being loaded) to what it
+    # imports, also through a call made while it loads (a lazy package attribute, Dialect.get_or_raise)
+    from importlib import _bootstrap_external as be
+    loading = []
+    real_exec = be._LoaderBasics.exec_module
+
+    def exec_hook(self, module):
+        loading.append(module.__name__)
+        try:
+            return real_exec(self, module)
+        finally:
+            loading.pop()
+
+    def note(dst):
+        src = loading[-1] if loading else None
+        if src and dst and src != dst and src.partition(".")[0] == "sqlglot" and dst.partition(".")[0] == "sqlglot":
+            parts = dst.split(".")
+            for i in range(1, len(parts) + 1):
+                d = ".".join(parts[:i])
+                if d != src:
+                    edges.setdefault(src, set()).add(d)
+
+    def note_obj(o):
+        if isinstance(o, types.ModuleType):
+            note(o.__name__)
+        else:
+            m = getattr(o, "__module__", None)
+            if isinstance(m, str):
+                note(m)
+
+    def hook(name, globals=None, locals=None, fromlist=(), level=0):
+        mod = real_import(name, globals, locals, fromlist, level)
+        a = name
+        if level:
+            try:
+                a = importlib.util.resolve_name("." * level + name, (globals or {}).get("__package__") or "")
+            except (ImportError, ValueError):
+                a = None
+        if a:
+            note(a)
+            for f in fromlist or ():
+                if f != "*":
+                    note_obj(getattr(sys.modules.get(a), f, None))
+        return mod
+
+    def hook_im(name, package=None):
+        mod = real_im(name, package)
+        note(mod.__name__)
+        return mod
+    import types
+    be._LoaderBasics.exec_module = exec_hook
+    builtins.__import__, importlib.import_module = hook, hook_im
+    import sqlglot
+    names = sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.", onerror=lambda n: None))
+    for name in names:
+        try:
+            real_im(name)
+        except BaseException:  # noqa: BLE001
+            pass
+    builtins.__import__, importlib.import_module = real_import, real_im
+    be._LoaderBasics.exec_module = real_exec
+    mutating = {"pop", "popitem", "update", "add", "clear", "remove", "discard", "setdefault", "extend", "append",
+                "insert", "__setitem__", "__delitem__", "sort", "reverse", "difference_update", "set",
+                "intersection_update", "symmetric_difference_update", "__ior__", "__iadd__", "__setattr__"}
+    fresh_values = (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.DictComp, ast.SetComp, ast.ListComp,
+                    ast.GeneratorExp, ast.Call, ast.BinOp, ast.Constant, ast.JoinedStr, ast.Lambda, ast.BoolOp,
+                    ast.Compare, ast.UnaryOp, ast.IfExp)
+
+    def calls(node):
+        todo = [node]
+        while todo:
+            n = todo.pop()
+            if isinstance(n, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if isinstance(n, ast.Call):
+                yield n
+            todo.extend(ast.iter_child_nodes(n))
+    unsafe = []
+    for name in ["sqlglot"] + names:
+        mo = sys.modules.get(name)
+        path = getattr(mo, "__file__", None) if mo else None
+        if not path:
+            continue
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read())
+        except (OSError, SyntaxError, ValueError):
+            unsafe.append(name)
+            continue
+        bad = []
+
+        def owned(t, own):  # a store into an object this body made itself
+            return isinstance(t.value, ast.Name) and t.value.id in own
+
+        def check(node, own):
+            for c in calls(node):
+                f = c.func
+                if isinstance(f, ast.Name) and f.id in ("setattr", "delattr"):
+                    bad.append(c.lineno)
+                elif isinstance(f, ast.Attribute) and f.attr in mutating and not \
+                        (isinstance(f.value, ast.Name) and f.value.id in own):
+                    bad.append(c.lineno)
+
+        def body(stmts, own):
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    for d in st.decorator_list:
+                        check(d, own)
+                    if isinstance(st, ast.ClassDef):
+                        for b in st.bases + [k.value for k in st.keywords]:
+                            check(b, own)
+                        body(st.body, set())
+                    own.add(st.name)
+                    continue
+                if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                    if st.value is not None:
+                        check(st.value, own)
+                    targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if isinstance(st, ast.AugAssign):
+                        if not (isinstance(st.target, ast.Name) and st.target.id in own):
+                            bad.append(st.lineno)
+                        continue
+                    for t in targets:
+                        for n in ast.walk(t):
+                            if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, ast.Store):
+                                if not owned(n, own):
+                                    bad.append(st.lineno)
+                                check(n.value, own)
+                                if isinstance(n, ast.Subscript):
+                                    check(n.slice, own)
+                            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                                if isinstance(st.value, fresh_values) and isinstance(t, ast.Name):
+                                    own.add(n.id)
+                                else:
+                                    own.discard(n.id)
+                    continue
+                if isinstance(st, ast.Delete):
+                    for t in st.targets:
+                        if isinstance(t, (ast.Attribute, ast.Subscript)) and not owned(t, own):
+                            bad.append(st.lineno)
+                    continue
+                if isinstance(st, (ast.If, ast.While)):
+                    check(st.test, own)
+                elif isinstance(st, (ast.For, ast.AsyncFor)):
+                    check(st.iter, own)
+                    for n in ast.walk(st.target):
+                        if isinstance(n, (ast.Attribute, ast.Subscript)):
+                            bad.append(st.lineno)
+                        elif isinstance(n, ast.Name):
+                            own.discard(n.id)
+                elif isinstance(st, (ast.With, ast.AsyncWith)):
+                    for it in st.items:
+                        check(it.context_expr, own)
+                elif isinstance(st, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+                    for hd in st.handlers:
+                        if hd.type is not None:
+                            check(hd.type, own)
+                elif isinstance(st, ast.Match):
+                    bad.append(st.lineno)
+                elif not isinstance(st, (ast.Import, ast.ImportFrom, ast.Pass, ast.Global, ast.Nonlocal,
+                                         ast.Break, ast.Continue)):
+                    check(st, own)
+                for f in ("body", "orelse", "finalbody"):
+                    if getattr(st, f, None):
+                        body(getattr(st, f), own)
+                for hd in getattr(st, "handlers", []):
+                    body(hd.body, own)
+        body(tree.body, set())
+        if bad:
+            unsafe.append(name)
+    with open(out, "w") as fh:
+        json.dump({"edges": {k: sorted(v) for k, v in edges.items()}, "unsafe": sorted(set(unsafe)),
+                   "modules": sorted(n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot."))}, fh)
+    return 0
 
 
 def snap_env():
@@ -1500,8 +1739,18 @@ def build_state_base(root, dest):
         ent_never = sorted(k for k in ents if ents[k] != e2.get(k))
         for r in runs:
             r["stats"].pop("ents", None)
+        gout = os.path.join(tmp, "graph.json")
+        subprocess.run([sys.executable, "-s", "-P", os.path.abspath(__file__), "--graph", root, gout],
+                       env=snap_env(), check=True, cwd="/tmp", stdout=subprocess.DEVNULL)
+        with open(gout) as fh:
+            graph = json.load(fh)
+        okeys = runs[0]["stats"].pop("okeys", [])
+        for r in runs:
+            r["stats"].pop("okeys", None)
         sd = {"keys": base, "unstable": unstable, "bags": b1["bags"], "never": never, "stats": runs[0]["stats"],
-              "ents": ents, "ent_never": ent_never}
+              "ents": ents, "ent_never": ent_never, "okeys": okeys, "graph": graph}
+        with open(dest + ".graph.json", "w") as fh:  # the main process's read: which changes the warm check takes
+            json.dump(graph, fh)
         with open(dest, "w") as fh:
             json.dump(sd, fh)
         with open(dest + ".pkl", "wb") as fh:  # the key check's fast read of the same base
@@ -1576,17 +1825,24 @@ def key_snap_main(argv):
     return 0
 
 
-def key_diff(base, new):
+def key_diff(base, new, scope=None):
     """{"diffs": [[key, module, gone, base record, new record]], "by_key": {key: changed entry keys, or None for a
     holder not compared entry by entry}} ("#n": the size changed, "#order": the keys or their order), or
     {"why": reason} when the trees cannot be compared."""
     nents = new["stats"].pop("ents", {})
-    if new["stats"].get("deep") or new["stats"].get("opaque") != base["stats"].get("opaque"):
-        return {"why": f"snapshot not comparable: {new['stats']} vs {base['stats']}"}
+    nokeys = set(new["stats"].pop("okeys", ()))
+    if scope is None:
+        if new["stats"].get("deep") or new["stats"].get("opaque") != base["stats"].get("opaque"):
+            return {"why": f"snapshot not comparable: {new['stats']} vs {base['stats']}"}
+        base_keys = base["keys"]
+    else:
+        base_keys = {k: base["keys"][k] for k in scope if k in base["keys"]}
+        if new["stats"].get("deep") or nokeys != set(base.get("okeys", ())) & set(base_keys) - {None}:
+            return {"why": f"snapshot not comparable: {new['stats']}, opaque {sorted(nokeys)[:5]}"}
     unstable, never, ent_never = set(base["unstable"]), set(base["never"]), set(base.get("ent_never", ()))
     diffs, by_key = [], {}
-    for k in sorted(set(base["keys"]) | set(new["keys"])):
-        a, b = base["keys"].get(k), new["keys"].get(k)
+    for k in sorted(set(base_keys) | set(new["keys"])):
+        a, b = base_keys.get(k), new["keys"].get(k)
         if k in never:
             return {"why": f"never comparable: {k}"}
         if k in unstable:
@@ -1607,9 +1863,155 @@ def key_diff(base, new):
     return {"diffs": diffs, "by_key": by_key}
 
 
+WARM_MAX_MODULES = 12  # the warm check re-imports at most this many modules (a changed module and its importers)
+KEY_MIN_WARM_S = float(os.environ.get("BR_KEY_MIN_WARM", 2.5))  # with a warm check (~0.2 s), commits whose chosen tests cost this much are worth one
+
+
+def mod_of(path):
+    m = path[:-3].replace("/", ".")
+    return m[: -len(".__init__")] if m.endswith(".__init__") else m
+
+
+def warm_group(graph, files):
+    """The modules a warm check re-imports for these changed files (each changed module and every module that
+    imports one while loading), or None when the fresh snapshot must be used."""
+    rev = graph.get("_rev")
+    if rev is None:
+        rev = graph["_rev"] = {}
+        for a, ds in graph["edges"].items():
+            for d in ds:
+                rev.setdefault(d, set()).add(a)
+    group = {mod_of(p) for p in files}
+    if not group <= set(graph["modules"]):
+        return None
+    todo = list(group)
+    while todo:
+        for a in rev.get(todo.pop(), ()):
+            if a not in group:
+                group.add(a)
+                todo.append(a)
+    if len(group) > WARM_MAX_MODULES or group & set(graph["unsafe"]) or "sqlglot" in group:
+        return None
+    return group
+
+
+class _TextLoader:
+    """Loads one module from a text in memory, compiled as a .pyc would be."""
+
+    def __init__(self, path, text):
+        self.path, self.text = path, text
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        import marshal
+        code = compile(self.text.encode("utf-8", "surrogateescape"), self.path, "exec", dont_inherit=True)
+        exec(marshal.loads(marshal.dumps(code)), module.__dict__)
+
+
+class _TextFinder:
+    """First on sys.meta_path in a warm check's child: the changed modules come from their patched text."""
+
+    def __init__(self, root, files):
+        self.texts = {mod_of(p): (os.path.join(root, p), p.endswith("/__init__.py"), t) for p, t in files.items()}
+
+    def find_spec(self, name, path=None, target=None):
+        import importlib.util
+        hit = self.texts.get(name)
+        if hit is None:
+            return None
+        where, is_pkg, text = hit
+        return importlib.util.spec_from_file_location(
+            name, where, loader=_TextLoader(where, text),
+            submodule_search_locations=[os.path.dirname(where)] if is_pkg else None)
+
+
+def key_server_main(argv):
+    """--key-server ROOT: import the pinned tree once, then for each job line on stdin ({"files", "mods", "out"})
+    fork a child that re-imports the job's modules from the patched texts, snapshots only them, writes the
+    key_diff answer to "out", and prints a line when it is done."""
+    import importlib
+    import pkgutil
+    import unittest  # noqa: F401
+    root = argv[0]
+    sys.setrecursionlimit(20000)
+    sys.path.insert(0, root)
+    import sqlglot
+    errs = {}
+    for name in sorted(x.name for x in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.", onerror=lambda n: None)):
+        try:
+            importlib.import_module(name)
+        except BaseException as exc:  # noqa: BLE001
+            errs[name] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    with open(SD + ".pkl", "rb") as fh:
+        base = pickle.load(fh)
+    mods = sorted(base["graph"]["modules"], key=len, reverse=True)
+
+    def root_of(k):
+        for m in mods:
+            if k.startswith(m) and k[len(m):len(m) + 1] in (".", ":"):
+                return m
+        return None
+    by_root = {}
+    for k in base["keys"]:
+        by_root.setdefault(k[len("IMPORTERROR:"):] if k.startswith("IMPORTERROR:") else root_of(k), []).append(k)
+    unstable = set(base["unstable"])
+
+    def want(key, whole, bag):
+        if key in unstable:
+            return bag != base["bags"].get(key)
+        rec = base["keys"].get(key)
+        return rec is None or rec[0] != whole
+    import gc
+    gc.freeze()
+    for line in sys.stdin:
+        job = json.loads(line)
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                group = set(job["mods"])
+                for m in sorted(group, key=len, reverse=True):
+                    old = sys.modules.pop(m, None)
+                    parent, _, leaf = m.rpartition(".")
+                    if old is not None and parent in sys.modules and getattr(sys.modules[parent], leaf, None) is old:
+                        delattr(sys.modules[parent], leaf)
+                # a package with a lazy __getattr__ keeps what it handed out in its globals: drop the re-made ones
+                for n, mo in list(sys.modules.items()):
+                    if (n == "sqlglot" or n.startswith("sqlglot.")) and n not in group and "__getattr__" in vars(mo):
+                        for a, v in list(vars(mo).items()):
+                            if not isinstance(v, types.ModuleType) and getattr(v, "__module__", None) in group:
+                                delattr(mo, a)
+                sys.meta_path.insert(0, _TextFinder(root, job["files"]))
+                new_errs = {}
+                for m in sorted(group):
+                    try:
+                        importlib.import_module(m)
+                    except BaseException as exc:  # noqa: BLE001
+                        new_errs[m] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                keys, bags, stats = snap_state(root, base["unstable"], want, roots=group, errs=new_errs)
+                scope = {k for m in group for k in by_root.get(m, ())} | {DIALECT_TABLE}
+                r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats}, scope)
+                with open(job["out"], "w") as fh:
+                    json.dump(r, fh)
+                code = 0
+            except BaseException as exc:  # noqa: BLE001
+                try:
+                    with open(job["out"], "w") as fh:
+                        json.dump({"why": f"warm check failed: {exc!r}"}, fh)
+                except OSError:
+                    pass
+            finally:
+                os._exit(code)
+        os.waitpid(pid, 0)
+        print("done", flush=True)
+    return 0
+
+
 def key_snap(files):
     """The key check of a patched tree ({path: text}), in one fresh process; its answer (dict)."""
-    tmp = patched_tree(files)
+    tmp = patched_tree(files, pyc=True)
     try:
         out = os.path.join(tmp, "keys.json")
         subprocess.run([sys.executable, "-s", "-P", os.path.abspath(__file__), "--key-snap", tmp, out],
@@ -1765,6 +2167,42 @@ def key_readers(m, diffs, by_key):
         for sk in ch:
             keep.update(r.get({"#n": "#l", "#order": "#k"}.get(sk, sk), ()))
     return keep
+
+
+def run_warm_checks(jobs, t0):
+    """{commit: answer} for jobs that carry "mods", through one key server; none starts after the budget."""
+    res = {}
+    if not jobs:
+        return res
+    tmp = tempfile.mkdtemp(prefix="kw")
+    try:
+        p = subprocess.Popen([sys.executable, "-s", "-P", os.path.abspath(__file__), "--key-server", SQ],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=snap_env(), cwd="/tmp")
+        try:
+            for i, k in enumerate(sorted(jobs)):
+                if time.time() - t0 > KEY_BUDGET_S:
+                    break
+                out = os.path.join(tmp, f"{i}.json")
+                p.stdin.write(json.dumps({"files": jobs[k]["files"], "mods": sorted(jobs[k]["mods"]), "out": out}) + "\n")
+                p.stdin.flush()
+                if p.stdout.readline().strip() != "done":
+                    break
+                with open(out) as fh:
+                    res[k] = json.load(fh)
+        finally:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    except Exception as exc:  # noqa: BLE001
+        print(f"warm key checks: {exc!r}", file=sys.stderr)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return res
 
 
 def run_key_checks(jobs, t0):
@@ -2241,6 +2679,13 @@ def prepare(dest):
         print("state base not built:", repr(exc))
         if os.path.exists(SD):
             os.remove(SD)
+    try:
+        with gzip.open(MAP, "rb") as fh:
+            d = json.loads(fh.read())
+        with open(str(MAP) + ".pkl", "wb") as fh:
+            pickle.dump(d, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:  # noqa: BLE001  (the map is then read from its JSON)
+        print("map pickle not written:", repr(exc))
 
 
 def build_tables(m, dest, out):
@@ -2501,8 +2946,10 @@ def run_plan(m, text):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
-                a = compile(src, fn, "exec", dont_inherit=True)
-                b = marshal.loads(marshal.dumps(compile(t, fn, "exec", dont_inherit=True)))  # as from a .pyc
+                # both as from a .pyc: a set constant read back from one can iterate in another order (and its
+                # repr with it) than the one the compiler built
+                a = marshal.loads(marshal.dumps(compile(src, fn, "exec", dont_inherit=True)))
+                b = marshal.loads(marshal.dumps(compile(t, fn, "exec", dont_inherit=True)))
             except (SyntaxError, ValueError):
                 return None
         got = []
@@ -2733,7 +3180,7 @@ def all_codes(c):
     return out
 
 
-def child_run(plan, order, tests, wfd, idx, skip_after):
+def child_run(plan, order, tests, wfd, idx, skip_after, red=None):
     """In the forked child: reproduce the patched tree, run `order` (test numbers, in run order), report lines
     "S n" (started), "V n code reached cpu_us" (code 0 pass, 1 fail, 2 not run or skipped), "X why" (doubt about
     the whole run), "END"."""
@@ -2803,6 +3250,13 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
                 failed_once[0] = True
                 continue
             case._br_n = n
+            if red and n in red:
+                try:
+                    bm = trimmed_method(case, meth, red[n])
+                except Exception:  # noqa: BLE001  (the whole method then runs, with the fixture entries it keeps)
+                    bm = None
+                if bm is not None:
+                    setattr(case, meth, bm)
             if n in skip_after:
                 real = getattr(case, meth)
 
@@ -2845,6 +3299,8 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
             def startTest(self, test):
                 super().startTest(test)
                 cur[0], cur[1] = test._br_n, False
+                spec = red.get(test._br_n) if red else None
+                _ENTRY_KEEP[0] = {f: set(v) for f, v in spec["files"].items()} if spec and spec["files"] else None
                 if codes:
                     mon.restart_events()
                 put(f"S {test._br_n}")
@@ -2861,6 +3317,7 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
 
             def stopTest(self, test):
                 super().stopTest(test)
+                _ENTRY_KEEP[0] = None
                 before, skipped, t0 = self._marks
                 code = 1 if self._problems() > before else 2 if skipped else 0
                 if code == 1:
@@ -2879,7 +3336,7 @@ def child_run(plan, order, tests, wfd, idx, skip_after):
         os._exit(0)
 
 
-def fork_run(plan, order, tests, idx, skip_after, allowed, cap, wall_left):
+def fork_run(plan, order, tests, idx, skip_after, allowed, cap, wall_left, red=None):
     """Fork, run, collect. ({n: (code, reached, cpu)}, status END / TIMEOUT / DIED, doubt or None)."""
     import select
     import signal
@@ -2891,7 +3348,7 @@ def fork_run(plan, order, tests, idx, skip_after, allowed, cap, wall_left):
             os.setpgid(0, 0)
         except OSError:
             pass
-        child_run(plan, order, tests, w, idx, skip_after)
+        child_run(plan, order, tests, w, idx, skip_after, red)
         os._exit(0)
     os.close(w)
     verdicts, status, doubt = {}, "DIED", None
@@ -2951,7 +3408,274 @@ def sim_cost(ts, ms):
     return (max(sum(ms[t] for t in x) for x in w) + WORKER_MS * len(w)) / 1000
 
 
-def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
+# Trimmed runs. What a costly test does splits into steps: each top-level statement of its method, and each entry a
+# fixture loader of tests.helpers hands it (work a pool task does is counted with the entry that queued it). The map
+# lists, per step, the sqlglot code objects the step ran on the pinned tree, and what ran outside every step. When
+# none of the functions a hot commit swaps ran outside the steps, a step that never ran one of them does at the
+# patched commit what it did at the pinned one, where the test passes; the test then runs with the steps that ran
+# one, the statements that share a local name with those (a value one makes and another reads or changes), and the
+# statements that may change anything else (attributes, globals, other modules, definitions, returns).
+TRIM = not os.environ.get("BR_WHOLE_TESTS")
+_ENTRY_KEEP = [None]  # in a run child: {fixture file: entry indices to yield} for the test that runs now
+_STMT_HARD_CALLS = {"setattr", "delattr", "exec", "eval", "globals", "locals", "vars", "__import__", "super"}
+_STMT_MUTATING = {"pop", "popitem", "update", "add", "clear", "remove", "discard", "setdefault", "extend", "append",
+                  "insert", "sort", "reverse", "set", "difference_update", "intersection_update", "setLevel",
+                  "addHandler", "removeHandler", "__setitem__", "__delitem__", "__setattr__"}
+_AST_CACHE = {}
+
+
+def step_record(m, tid):
+    pm = m.d.get("steps")
+    if not pm:
+        return None
+    dec = pm.setdefault("_dec", {})
+    if tid not in dec:
+        b = pm["tests"].get(tid)
+        r = json.loads(zlib.decompress(base64.b64decode(b))) if b else None
+        if r is not None:
+            r["_base"] = set(r["base"])
+            cb = pm["classes"].get(r["cls"])
+            r["_base"] |= set(json.loads(zlib.decompress(base64.b64decode(cb)))) if cb else set()
+        dec[tid] = r
+    return dec[tid]
+
+
+def method_node(path, line):
+    """The FunctionDef that starts at line of the pinned test file, or None."""
+    if path not in _AST_CACHE:
+        try:
+            with open(os.path.join(ST, path), encoding="utf-8") as fh:
+                _AST_CACHE[path] = ast.parse(fh.read())
+        except (OSError, SyntaxError, ValueError):
+            _AST_CACHE[path] = None
+    tree = _AST_CACHE[path]
+    if tree is None:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.lineno == line:
+            return node
+    return None
+
+
+def stmt_closure(fn, keep):
+    """The statements of fn to run so that the statements in keep run as in the whole method, or None when its
+    statements cannot be left out."""
+    if isinstance(fn, ast.AsyncFunctionDef) or fn.decorator_list:
+        return None
+    nodes = list(ast.walk(fn))
+    if any(isinstance(n, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)) for n in nodes) or any(
+            isinstance(n, ast.Attribute) and n.attr.startswith("__") and not n.attr.endswith("__") for n in nodes) or any(
+            isinstance(n, ast.Name) and n.id in ("super", "__class__", "locals", "vars", "exec", "eval") for n in nodes):
+        return None
+    a = fn.args
+    local = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+    local |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
+    for n in nodes:
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            local.add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n is not fn:
+            local.add(n.name)
+        elif isinstance(n, ast.alias):
+            local.add((n.asname or n.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            local.add(n.name)
+    if a.args:
+        local.discard(a.args[0].arg)  # self: what a statement does to it counts as a change outside (hard)
+    droppable = (ast.Expr, ast.With, ast.For, ast.If, ast.Try, ast.Assert, ast.Assign, ast.AnnAssign, ast.AugAssign,
+                 ast.Pass, getattr(ast, "TryStar", ast.Try))
+
+    def root(x):
+        while isinstance(x, (ast.Attribute, ast.Subscript, ast.Call, ast.Starred)):
+            x = x.func if isinstance(x, ast.Call) else x.value
+        return x.id if isinstance(x, ast.Name) else None
+
+    parent = list(range(len(fn.body)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    owner, hard = {}, set()
+    for i, st in enumerate(fn.body):
+        if not isinstance(st, droppable):
+            hard.add(i)
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name) and n.id in local:
+                if n.id in owner:
+                    parent[find(i)] = find(owner[n.id])
+                else:
+                    owner[n.id] = i
+            elif isinstance(n, (ast.Return, ast.Delete)):
+                hard.add(i)
+            elif isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                if root(n) not in local:
+                    hard.add(i)
+            elif isinstance(n, ast.Call):
+                f = n.func
+                if isinstance(f, ast.Name) and f.id in _STMT_HARD_CALLS:
+                    hard.add(i)
+                elif isinstance(f, ast.Attribute) and f.attr in _STMT_MUTATING and root(f.value) not in local:
+                    hard.add(i)
+    comps = {find(i) for i in set(keep) | hard}
+    return {i for i in range(len(fn.body)) if find(i) in comps}
+
+
+def trims(m, plan, cands, tests):
+    """{test: {"frac", "stmts" (statement indices to run, or None for all), "files" ({fixture file: entry indices
+    to yield}), "file", "line"}} for the candidates of a hot plan that can run trimmed."""
+    if not TRIM or not plan or plan["mode"] != "hot" or not plan["pairs"] or not m.d.get("steps"):
+        return {}
+    if any(not p.startswith("sqlglot/") or not p.endswith(".py") for p in plan["files"]):
+        return {}
+    pm = m.d["steps"]
+    ix = pm.get("_ix")
+    if ix is None:
+        ix = pm["_ix"] = {nm: i for i, nm in enumerate(pm["names"])}
+    changed = set()
+    for x, _ in plan["pairs"]:
+        rel = os.path.relpath(x.co_filename, ST).replace(os.sep, "/")
+        for c in all_codes(x):
+            cid = ix.get(f"{rel}:{c.co_firstlineno}:{c.co_qualname}")
+            if cid is not None:
+                changed.add(cid)
+    out = {}
+    if not changed:
+        return out
+    for n in cands:
+        tid = tests[n]["id"]
+        try:
+            r = step_record(m, tid)
+            spec = trim_spec(r, changed) if r is not None else None
+        except Exception as exc:  # noqa: BLE001
+            _log(tid, "trim:", repr(exc))
+            spec = None
+        if spec is not None:
+            out[n] = spec
+    return out
+
+
+def trim_spec(r, changed):
+    if changed & r["_base"]:
+        return None
+    steps = r["steps"]
+    keep = 0
+    for mask, xs in r["groups"]:
+        if not changed.isdisjoint(xs):
+            keep |= int(mask, 16)
+    if not keep or keep == (1 << len(steps)) - 1:
+        return None
+    direct, entries = set(), {}
+    for i, p in enumerate(steps):
+        if keep >> i & 1:
+            if p.startswith("s:"):
+                direct.add(int(p[2:]))
+            else:
+                f, j = p[2:].rsplit(":", 1)
+                entries.setdefault(f, set()).add(int(j))
+    files = r.get("files", {})
+    stmts = set(direct)
+    filt = {}
+    for f, st in files.items():
+        if -1 in st:
+            return None
+        if any(x in direct for x in st):
+            continue  # a statement that changed itself loads it: every entry
+        filt[f] = entries.get(f, set())
+        if filt[f]:
+            stmts.update(st)
+    if any(f not in files for f in entries):
+        return None
+    info = r["info"]
+    node = method_node(info["file"], info["line"])
+    if node is None or len(node.body) != info["n"]:
+        return None
+    run = None if info.get("deco") else stmt_closure(node, stmts)
+    if run is not None and len(run) == info["n"]:
+        run = None
+    if run is None and not filt:
+        return None
+    on = set(range(info["n"])) if run is None else run
+    t_all = r["base_cost"] + sum(r["cost"])
+    t_run = r["base_cost"]
+    for i, p in enumerate(steps):
+        if p.startswith("s:"):
+            t_run += r["cost"][i] if int(p[2:]) in on else 0.0
+        else:
+            f, j = p[2:].rsplit(":", 1)
+            if f in filt:
+                t_run += r["cost"][i] if int(j) in filt[f] else 0.0
+            elif any(x in on for x in files.get(f, ())):
+                t_run += r["cost"][i]
+    frac = max(0.02, t_run / t_all) if t_all > 0 else 1.0
+    return {"frac": frac, "stmts": None if run is None else sorted(run), "files": {f: sorted(v) for f, v in filt.items()},
+            "file": info["file"], "line": info["line"]}
+
+
+def install_entry_filter():
+    """In the parent, before the test modules import: the fixture loaders of tests.helpers yield only the entries a
+    trimmed test keeps (all of them outside such a test)."""
+    import functools
+    import inspect
+    try:
+        import tests.helpers as H
+    except Exception:  # noqa: BLE001
+        return False
+    if getattr(H, "_br_filter", False):
+        return True
+    origs = {}
+    for name in ("load_sql_fixture_pairs", "load_sql_fixtures"):
+        f = getattr(H, name, None)
+        if not inspect.isgeneratorfunction(f):
+            return False
+        origs[name] = f
+
+    def make(orig):
+        @functools.wraps(orig)
+        def gen(filename):
+            keep = _ENTRY_KEEP[0]
+            want = keep.get(filename) if keep else None
+            if want is None:
+                yield from orig(filename)
+                return
+            for j, item in enumerate(orig(filename)):
+                if j in want:
+                    yield item
+        return gen
+    for name, f in origs.items():
+        setattr(H, name, make(f))
+    H._br_filter = True
+    return True
+
+
+def trimmed_method(case, meth, spec):
+    """The test method with only the statements spec keeps, bound to case, or None."""
+    if spec.get("stmts") is None:
+        return None
+    fn = getattr(type(case), meth, None)
+    if not isinstance(fn, types.FunctionType) or fn.__code__.co_freevars:
+        return None
+    path = os.path.join(ST, spec["file"])
+    if fn.__code__.co_filename != path or fn.__code__.co_firstlineno != spec["line"]:
+        return None
+    node = method_node(spec["file"], spec["line"])
+    if node is None or node.name != meth:
+        return None
+    new = copy.copy(node)
+    new.body = [node.body[i] for i in spec["stmts"]] or [ast.Pass()]
+    new.decorator_list = []
+    mod = ast.Module(body=[new], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ns = {}
+    exec(compile(mod, path, "exec", dont_inherit=True), fn.__globals__, ns)
+    f2 = ns.get(meth)
+    if not isinstance(f2, types.FunctionType):
+        return None
+    f2.__qualname__ = fn.__qualname__
+    return types.MethodType(f2, case)
+
+
+def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
     """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate, classmates
     of test_execute_tpcds run here), or None when the runs cannot save more than they cost."""
     cpu, cls_cpu, bad = info.get("cpu", {}), info.get("cls", {}), set(info.get("bad", ()))
@@ -2970,7 +3694,8 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0):
 
     def cost(n):
         c = cpu.get(tests[n]["id"])
-        return c if c is not None else 1.5 * ms[n] / 1000 + 0.01
+        c = c if c is not None else 1.5 * ms[n] / 1000 + 0.01
+        return c * red[n]["frac"] if red and n in red else c
 
     def runnable(n):
         tid = tests[n]["id"]
@@ -3079,12 +3804,13 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
     for c, cands, text in work:
         try:
             plan = run_plan(m, text)
-            ch = run_choice(m, plan, cands, tests, ms, info, tp, mates_all) if plan else None
+            red = trims(m, plan, cands, tests) if plan else {}
+            ch = run_choice(m, plan, cands, tests, ms, info, tp, mates_all, red) if plan else None
         except Exception as exc:  # noqa: BLE001
             _log(c, "plan:", repr(exc))
             continue
         if ch is not None:
-            jobs.append([c, cands, plan, ch])
+            jobs.append([c, cands, plan, ch, red])
     if not jobs:
         return {}, set()
     for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -3118,6 +3844,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
     sys.addaudithook(lambda e, a: audit(e, a) if auditing[0] else None)
     mods = sorted({tests[n]["id"].split("::")[0][:-3].replace("/", ".") for j in jobs for n in j[3][0]})
     t_imp = time.process_time()
+    filtered = any(j[4] for j in jobs) and install_entry_filter()
     for name in mods:
         try:
             __import__(name)
@@ -3128,28 +3855,43 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
     mon.register_callback(mon.COVERAGE_ID, mon.events.PY_START, None)
     mon.free_tool_id(mon.COVERAGE_ID)
     mon.restart_events()
-    _log(f"parent import {time.process_time() - t_imp:.2f} s CPU, {len(mods)} test modules")
+    _log(f"parent import {time.process_time() - t_imp:.2f} s CPU, {len(mods)} test modules, hit {sorted(hit)}")
     for j in jobs:
         plan = j[2]
         if plan["mode"] == "hot" and (j[0] in hit or any(os.path.join(ST, p) in opened for p in plan["files"]
                                                          if not p.endswith(".py"))):
             plan["mode"], plan["pairs"] = "fresh", []
+            j[4] = {}
+            j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
+        elif j[4] and not filtered:
+            j[4] = {}
             j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     gc.freeze()
     out, tp_ok = {}, set()
     jobs.sort(key=lambda j: j[3][4])
-    for c, cands, plan, (run, skip_after, allowed, cap, spend, mates) in jobs:
+    for c, cands, plan, (run, skip_after, allowed, cap, spend, mates), red in jobs:
         left = t_start + RUN_DEADLINE_S - time.monotonic()
         if left < 5.0:
             break
         try:
             exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
             before = os.times()
-            verdicts, status, doubt = fork_run(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0)
+            verdicts, status, doubt = fork_run(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0, red)
             after = os.times()
             used = after.children_user + after.children_system - before.children_user - before.children_system
+            if os.environ.get("BR_TRIM_AUDIT") and any(n in red for n in run):  # dev: the whole tests agree
+                v2, st2, d2 = fork_run(plan, run, tests, idx, set(), {n: 60.0 for n in run}, None, 120.0, None)
+                for n in run:
+                    if n not in red or n not in v2 or n not in verdicts or verdicts[n][0] == 2 or v2[n][0] == 2:
+                        continue
+                    if verdicts[n][0] != v2[n][0]:
+                        print(f"TRIM MISMATCH {c} {tests[n]['id']} trimmed {verdicts[n][0]} whole {v2[n][0]}",
+                              file=sys.stderr, flush=True)
+                    else:
+                        print(f"TRIM OK {c} {n} {verdicts[n][0]} {verdicts[n][2]:.3f} {v2[n][2]:.3f}",
+                              file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001
             _log(c, "run:", repr(exc))
             continue
@@ -3167,7 +3909,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
                 and not any(mates_all >> n & 1 for n in failing) and any(n in passed for n in mates)
                 and not any(mates_all >> n & 1 and v[0] == 0 and n not in passed for n, v in verdicts.items())):
             tp_ok.add(c)
-        _log(f"{c} {plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} pass {len(passed)} "
+        _log(f"{c} {plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} trimmed "
+             f"{sum(1 for n in run if n in red)} pass {len(passed)} "
              f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}"
              + (f" mates {len(mates)} {'drop tpcds' if c in tp_ok else 'keep tpcds'}" if mates else ""))
     return out, tp_ok
@@ -3308,21 +4051,35 @@ def key_phase(m, tests, ms, rows, out):
             return 0.0
         w = pack(ts, ms)
         return (max(sum(ms[t] for t in x) for x in w) + WORKER_MS * len(w)) / 1000
+    graph = None
+    try:
+        with open(SD + ".graph.json") as fh:
+            graph = json.load(fh)
+    except (OSError, ValueError):
+        pass
     jobs = {}
     for stem, chosen, text in rows:
-        if cost(chosen) < KEY_MIN_S:
+        c = cost(chosen)
+        if c < KEY_MIN_WARM_S:
             continue
         try:
             files = key_job(m, text)
+            if files and graph is not None:
+                files["mods"] = warm_group(graph, files["files"])
         except Exception as exc:  # noqa: BLE001
             print(f"{stem}: key job: {exc!r}", file=sys.stderr)
             files = None
-        if files:
+        if files and (files.get("mods") is not None or c >= KEY_MIN_S):
             jobs[stem] = files
-    _log(f"key checks: {len(jobs)}")
+    _log(f"key checks: {len(jobs)}, warm {sum(1 for j in jobs.values() if j.get('mods') is not None)}")
     if not jobs:
         return no_run
-    res = run_key_checks(jobs, time.time())
+    t0 = time.time()
+    res = run_warm_checks({k: j for k, j in jobs.items() if j.get("mods") is not None}, t0)
+    # a warm answer that could not compare goes the fresh way, where the gate allows it
+    fresh = {k: j for k, j in jobs.items() if (k not in res or "why" in res[k]) and cost(
+        next(ch for st, ch, _ in rows if st == k)) >= KEY_MIN_S}
+    res.update(run_key_checks(fresh, t0))
     for stem, r in res.items():
         if not r or "why" in r:
             print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
@@ -3426,6 +4183,10 @@ if __name__ == "__main__":
         sys.exit(cls_check())
     elif sys.argv[1:2] == ["--key-check"]:
         sys.exit(key_check())
+    elif sys.argv[1:2] == ["--key-server"]:
+        sys.exit(key_server_main(sys.argv[2:3]))
+    elif sys.argv[1:2] == ["--graph"]:
+        sys.exit(graph_main(sys.argv[2:4]))
     elif sys.argv[1:2] == ["--key-snap"]:
         sys.exit(key_snap_main(sys.argv[2:4]))
     elif sys.argv[1:2] == ["--snap"]:
