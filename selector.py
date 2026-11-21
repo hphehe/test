@@ -1,11 +1,13 @@
 """Pick the tests each change can break, from a map of which tests execute which lines of sqlglot."""
 
+import ast
 import base64
 import gzip
 import json
 import os
 import re
 import sys
+import textwrap
 from bisect import bisect_right
 from pathlib import Path
 
@@ -15,6 +17,12 @@ WORKER_MS = 2000
 MAX_WORKERS = 8
 # Files whose change can alter how pytest runs every test.
 CONFIG_FILES = {"setup.cfg", "pyproject.toml", "setup.py", "conftest.py", "tests/conftest.py", "pytest.ini", "tox.ini"}
+# A line opening one of these clauses extends the statement before it rather than starting a new one.
+CLAUSE = re.compile(r"(else|elif|except|finally|case)\b")
+FRAGMENT_BINDS = re.compile(r"\w+\s*:=|\byield\b|\bawait\b")
+# Comparison operators, in the order the map's per-site masks use.
+CMP_OPS = ["is", "is not", "==", "!=", "<", "<=", ">", ">="]
+CMP_RE = re.compile(r"\bis not\b|\bis\b|==|!=|<=|>=|<|>")
 
 
 def parse_patch(text):
@@ -112,6 +120,37 @@ class Spans:
         return None
 
 
+class Blocks:
+    """Runtime blocks of one file, [lo, hi, col, fn set, [[start, end, set], ...]], looked up by column."""
+
+    def __init__(self, rows):
+        self.by_col = {}
+        for r in rows:
+            self.by_col.setdefault(r[2], []).append(r)
+        self.los = {c: [r[0] for r in rs] for c, rs in self.by_col.items()}
+
+    def find(self, col, at):
+        """The block that code at indentation `col`, inserted before old line `at`, would join."""
+        rows = self.by_col.get(col)
+        if not rows:
+            return None
+        i = bisect_right(self.los[col], at) - 1
+        while i >= 0:
+            if rows[i][0] <= at <= rows[i][1]:
+                return rows[i]
+            i -= 1
+        return None
+
+    def innermost(self, at):
+        """The deepest block whose lines run across old line `at`."""
+        best = None
+        for col in self.by_col:
+            b = self.find(col, at)
+            if b is not None and (best is None or col > best[2]):
+                best = b
+        return best
+
+
 class Map:
     def __init__(self, path):
         with gzip.open(path, "rb") as fh:
@@ -119,6 +158,20 @@ class Map:
         self.n = self.d["n_tests"]
         self._sets = {}
         self._spans = {}
+        self._blocks = {}
+
+    def blocks(self, path):
+        if path not in self._blocks:
+            self._blocks[path] = Blocks(json.loads(self.d["files"][path].get("blk", "[]")))
+        return self._blocks[path]
+
+    def same_results(self, path):
+        """{"line:col": mask}: at the comparison whose operator starts there, bit j says CMP_OPS[j] gave the same
+        result as the operator written, on every evaluation while the whole suite ran at the pinned commit."""
+        key = (path, "cmp")
+        if key not in self._blocks:
+            self._blocks[key] = json.loads(self.d["files"][path].get("cmp", "{}"))
+        return self._blocks[key]
 
     def set(self, sid):
         s = self._sets.get(sid)
@@ -150,40 +203,174 @@ def block_lines(block):
     return [x for x in (at - 1, at) if x > 0], True
 
 
+def indent(text):
+    return len(text) - len(text.lstrip())
+
+
+def bound_names(texts):
+    """Names some code binds, plus markers for yield and await (which change the whole function), or None when the
+    code does not parse on its own (a fragment of a longer statement)."""
+    src = textwrap.dedent("\n".join(t for t in texts if not is_comment_or_blank(t)))
+    last = src.splitlines()[-1] if src else ""
+    if re.match(r"(else|elif)\b", src):
+        src = "if _:\n    pass\n" + src  # a clause parses only after the statement it extends
+    elif re.match(r"(except|finally)\b", src):
+        src = "try:\n    pass\n" + src
+    tree = None
+    for attempt in (src, f"{src}\n{' ' * (indent(last) + 4)}pass"):  # the second closes a header line
+        try:
+            tree = ast.parse(attempt)
+            break
+        except Exception:
+            continue
+    if tree is None:
+        return None
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            names.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update("global " + n for n in node.names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(a.asname or a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        elif isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await)):
+            names.add("<" + type(node).__name__ + ">")
+    return names
+
+
+def scoping_changed(removed, added, fragment):
+    """Whether an edit may bind or unbind a name (a function's locals are decided by its whole body).
+    `fragment`: the edit lies inside one statement."""
+    old = [t for _, t in removed if not is_comment_or_blank(t)]
+    new = [t for t in added if not is_comment_or_blank(t)]
+    if not fragment:
+        a = bound_names(new) if new else set()
+        r = bound_names(old) if old else set()
+        if a is not None and r is not None:
+            return a != r
+        if not old:
+            return True  # inserted code that does not parse on its own may bind anything
+    # Inside a statement only `:=` binds; yield and await change the whole function.
+    return sorted(FRAGMENT_BINDS.findall("\n".join(old))) != sorted(FRAGMENT_BINDS.findall("\n".join(new)))
+
+
+def operator_swap(old, new):
+    """(column, index in CMP_OPS) when `new` is `old` with one comparison operator replaced by another, else None."""
+    for mt in CMP_RE.finditer(old):
+        for j, op in enumerate(CMP_OPS):
+            if op != mt.group() and old[: mt.start()] + op + old[mt.end():] == new:
+                return mt.start(), j
+    return None
+
+
+def same_everywhere(m, path, removed, added):
+    """True when every changed line only swaps a comparison operator for one that gave the same result at that
+    comparison on every evaluation the test suite makes: then no test can behave differently."""
+    if not removed or len(removed) != len(added):
+        return False
+    sites = m.same_results(path)
+    swapped = False
+    for (x, old), new in zip(removed, added):
+        if old == new:
+            continue
+        sw = operator_swap(old, new)
+        if sw is None or not sites.get(f"{x}:{sw[0]}", 0) >> sw[1] & 1:
+            return False
+        swapped = True
+    return swapped
+
+
+def land(m, path, at, col, clause):
+    """Tests that can reach code put before old line `at` at indentation `col`, or None when that code would run at
+    load time (module or class level) or cannot be placed. `clause`: the code opens an else/except/... clause."""
+    b = m.blocks(path).find(col, at)
+    if b is None:
+        return None
+    prev = nxt = None
+    for s in b[4]:
+        if s[0] < at:
+            prev = s
+        else:
+            nxt = s
+            break
+    if prev is not None and (clause or nxt is None or prev[1] >= at):
+        return m.set(prev[2])  # it can run only after `prev` started
+    if nxt is not None and not clause:
+        return m.set(nxt[2])  # it runs exactly when `nxt` would have started
+    return None
+
+
 def select_sqlglot(m, path, blocks):
     info = m.d["files"][path]
     strings = m.spans(path, "str")
     rt, imp = m.spans(path, "rt"), m.spans(path, "imp")
+    importers = m.set(info["importers"])
+
+    def statement(r, i):
+        """A change to a statement: who runs it, or who loads the module if it runs at load time."""
+        if r is not None:
+            return m.set(r[2])
+        if len(i) > 2:
+            return m.set(i[2])  # a load-time statement, priced by who reads what it defines
+        return importers
+
     sel = 0
-    for block in blocks:
-        removed, added, at = block
-        lines, insertion = block_lines(block)
+    for removed, added, at in blocks:
         texts = [t for _, t in removed] + added
-        if insertion:
-            # Inserted before old line `at`: inside a string only if the string runs across that gap.
-            s = strings.find(at)
-            in_string = s is not None and s[0] < at
+        if removed:
+            in_string = any(strings.find(x) for x, _ in removed)
         else:
-            in_string = any(strings.find(x) for x in lines)
+            s = strings.find(at)  # inserted before old line `at`: inside a string only if it runs across that gap
+            in_string = s is not None and s[0] < at
         # Only comments or blank lines, none inside a multi-line string: nothing runs differently.
         if all(is_comment_or_blank(t) for t in texts) and not in_string:
             continue
-        hits = [(x, rt.find(x), imp.find(x)) for x in lines]
-        if insertion:
-            runtime = [r for _, r, _ in hits if r is not None]
-            # Between two statements of a function body (or after its last one): it runs where they run.
-            if runtime and all(i is None for _, _, i in hits):
-                for r in runtime:
-                    sel |= m.set(r[2])
+        if same_everywhere(m, path, removed, added):
+            continue
+        # Removed lines: each changes or deletes the statement it belongs to.
+        for x, t in removed:
+            if is_comment_or_blank(t) and not strings.find(x):
                 continue
-        for x, r, i in hits:
-            if r is not None:
-                sel |= m.set(r[2])
-            if r is None or insertion:
-                if i is not None and len(i) > 2 and not insertion:
-                    sel |= m.set(i[2])  # a load-time statement, priced by who reads what it defines
-                elif i is not None or not insertion:
-                    sel |= m.set(info["importers"])
+            r, i = rt.find(x), imp.find(x)
+            if r is not None or i is not None:
+                sel |= statement(r, i)
+            else:
+                got = land(m, path, x, indent(t), True)  # a clause line (`else:`): price the statement it extends
+                sel |= importers if got is None else got
+        # Added lines: inside a statement that runs across the gap they belong to it; else place them by indentation.
+        code = [t for t in added if not is_comment_or_blank(t)]
+        r, i = rt.find(at), imp.find(at)
+        r = r if r is not None and r[0] < at else None
+        i = i if i is not None and i[0] < at else None
+        if r is not None or i is not None:
+            if not removed:
+                sel |= statement(r, i)
+        elif code:
+            first_old = next((t for _, t in removed if not is_comment_or_blank(t)), None)
+            in_place = indent(first_old) if first_old is not None else None
+            low = None
+            for t in code:
+                c = indent(t)
+                if low is not None and c >= low:
+                    continue  # nested in (or continuing) an added line above
+                low = c
+                if c == in_place:
+                    continue  # takes the removed statements' place: priced above
+                got = land(m, path, at, c, bool(CLAUSE.match(t.lstrip())))
+                sel |= importers if got is None else got
+        # A new or dropped name binding changes scoping in the whole function (yield makes it a generator).
+        if not (in_string and not removed) and scoping_changed(removed, added, r is not None or i is not None):
+            first = next((t for t in [t for _, t in removed] + added if not is_comment_or_blank(t)), "")
+            b = m.blocks(path).find(indent(first), at)
+            if b is None and r is not None:
+                b = m.blocks(path).innermost(at)
+            sel |= importers if b is None else m.set(b[3])
     return sel
 
 
