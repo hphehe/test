@@ -1130,7 +1130,8 @@ def query_check(job, tmp):
 # or unreadable value, a read while the tables are built) keeps the test.
 
 SD = os.environ.get("BR_SD", "/app/sd.json")  # import-time state of the pinned tree, written by --prepare
-SNAP_EST_S = 1.5  # CPU of the patched-tree snapshot (import everything + fingerprints), upper estimate
+SNAP_EST_S = 1.5
+PROBE_EST_S = 0.6  # CPU of one fresh-process import probe (python + import sqlglot + the statement)  # CPU of the patched-tree snapshot (import everything + fingerprints), upper estimate
 SNAP_SKIP_CLASS = {"__dict__", "__weakref__", "__module__", "__qualname__", "__firstlineno__", "__static_attributes__",
                    "__doc__"}
 SNAP_SKIP_MOD = {"__file__", "__cached__", "__spec__", "__loader__", "__builtins__", "__path__", "__name__",
@@ -1302,10 +1303,12 @@ def snap_state(root, bag_keys=()):
             if k in SNAP_SKIP_MOD:
                 continue
             if isinstance(v, type) and v.__module__ == n and v.__qualname__ == k:
-                keys[f"{n}:{k}"] = [h(cls_ref(v)), "G", n, ""]
+                keys[f"{n}:{k}"] = [h(cls_ref(v)), "GT", n, ""]
                 do_class(v, f"{n}.{k}", n, k)
+            elif isinstance(v, types.ModuleType):
+                put(f"{n}:{k}", v, "GM", n, "")
             else:
-                put(f"{n}:{k}", v, "G", n, "")
+                put(f"{n}:{k}", v, {"T": "GT", "F": "GF"}.get(tag(v), "G"), n, "")
     for n, e in errs.items():
         keys["IMPORTERROR:" + n] = [h(e), "E", n, ""]
     stats["modules"] = len([n for n in sys.modules if n == "sqlglot" or n.startswith("sqlglot.")])
@@ -1423,74 +1426,183 @@ def nonbody_only(old_text, new_text):
     return ast.dump(old_t) != ast.dump(new_t)
 
 
-def class_values_only(old_text, new_text):
-    """True when, with function bodies left out, the two sources differ only in the values assigned to plain names
-    directly in class bodies (`NAME = value`, `NAME: T = value`). Anything else (a module global, a decorator, a
-    deleted or added statement, a renamed target) cannot pass the state check, so it is not worth its CPU."""
+def _stub(text):
+    t = ast.parse(text)
+    for _, n in outer_functions(t):
+        n.body = [ast.Pass()]
+    return t
+
+
+def _blank(t):
+    """What v10's check can follow, blanked out: values of `NAME = ...` in class bodies and at module level (also
+    inside module-level if/try/with blocks), module-level if tests, def lines (arguments, defaults, decorators,
+    return annotations), docstrings."""
+    def doc(body):
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and \
+                isinstance(body[0].value.value, str):
+            body[0].value = ast.Constant("")
+
+    def fn(n):
+        n.args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None,
+                               defaults=[])
+        n.decorator_list, n.returns = [], None
+
+    def assign(st):
+        if isinstance(st, ast.Assign) and all(isinstance(x, ast.Name) for x in st.targets):
+            st.value = ast.Constant(None)
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            st.value = ast.Constant(None)
+
+    def module_body(body):
+        for st in body:
+            assign(st)
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn(st)
+            elif isinstance(st, ast.ClassDef):
+                class_body(st)
+            elif isinstance(st, ast.If):
+                st.test = ast.Constant(None)
+                module_body(st.body)
+                module_body(st.orelse)
+            elif isinstance(st, (ast.Try, ast.With)):
+                for f in ("body", "orelse", "finalbody"):
+                    module_body(getattr(st, f, []))
+                for hd in getattr(st, "handlers", []):
+                    module_body(hd.body)
+
+    def class_body(c):
+        doc(c.body)
+        for st in c.body:
+            assign(st)
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                fn(st)
+            elif isinstance(st, ast.ClassDef):
+                class_body(st)
+    doc(t.body)
+    module_body(t.body)
+    return t
+
+
+def import_code(st, mod, is_pkg):
+    """An import statement as absolute source code (None: not an import)."""
+    if isinstance(st, ast.Import):
+        return "import " + ", ".join(a.name for a in st.names)
+    if isinstance(st, ast.ImportFrom):
+        base = st.module or ""
+        if st.level:
+            pkg = mod.split(".") if is_pkg else mod.split(".")[:-1]
+            pkg = pkg[: len(pkg) - (st.level - 1)]
+            base = ".".join(pkg + ([st.module] if st.module else []))
+        return f"from {base} import " + ", ".join(a.name for a in st.names)
+    return None
+
+
+def static_items(old_text, new_text, mod, is_pkg=False):
+    """None when, with function bodies left out, the change edits something v10's check cannot follow (a statement
+    added, removed or replaced, class bases or decorators, ...). Else the edited names:
+    ("c", module, class qualname, name) for class entries, ("m", module, name) for module globals."""
     try:
-        trees = [ast.parse(old_text), ast.parse(new_text)]
+        a, b = _stub(old_text), _stub(new_text)
+        if ast.dump(_blank(_stub(old_text))) != ast.dump(_blank(_stub(new_text))):
+            return None
     except (SyntaxError, ValueError):
-        return False
-    for t in trees:
-        for _, n in outer_functions(t):
-            n.body = [ast.Pass()]
-        for c in ast.walk(t):
-            if isinstance(c, (ast.ClassDef, ast.Module)) and c.body and isinstance(c.body[0], ast.Expr) and \
-                    isinstance(c.body[0].value, ast.Constant) and isinstance(c.body[0].value.value, str):
-                c.body[0].value = ast.Constant("")  # a docstring: the state check leaves __doc__ out
-            if isinstance(c, ast.ClassDef):
-                for st in c.body:
-                    if isinstance(st, ast.Assign) and all(isinstance(x, ast.Name) for x in st.targets):
-                        st.value = ast.Constant(None)
-                    elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
-                        st.value = ast.Constant(None)
-    return ast.dump(trees[0]) == ast.dump(trees[1])
-
-
-def class_value_changes(old_text, new_text):
-    """[(class qualname, name)] whose assigned value differs (sources that pass class_values_only)."""
-    def rows(text):
-        out = []
-
-        def rec(body, qual):
-            for st in body:
-                if isinstance(st, ast.ClassDef):
-                    q = f"{qual}.{st.name}" if qual else st.name
-                    for x in st.body:
-                        if isinstance(x, ast.Assign) and all(isinstance(t, ast.Name) for t in x.targets):
-                            out.append([(q, t.id) for t in x.targets] + [ast.dump(x.value)])
-                        elif isinstance(x, ast.AnnAssign) and isinstance(x.target, ast.Name) and x.value is not None:
-                            out.append([(q, x.target.id), ast.dump(x.value)])
-                    rec(st.body, q)
-                elif isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While)):
-                    for f in ("body", "orelse", "finalbody"):
-                        rec(getattr(st, f, []), qual)
-                    for h in getattr(st, "handlers", []):
-                        rec(h.body, qual)
-        rec(ast.parse(text).body, "")
-        return out
-    a, b = rows(old_text), rows(new_text)
-    if len(a) != len(b):
         return None
-    return [p for x, y in zip(a, b) if x != y for p in x[:-1]]
+    items = []
+
+    def bound(body):
+        out = set()
+        for st in body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    out.add(n.id)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    out.add(n.name)
+                elif isinstance(n, ast.alias):
+                    out.add((n.asname or n.name).split(".")[0])
+        return out
+
+    def names_of(st):
+        if isinstance(st, ast.Assign):
+            return [x.id for x in st.targets]
+        if isinstance(st, ast.AnnAssign):
+            return [st.target.id]
+        return [st.name]
+
+    def walk(x, y, qual):
+        for p, q in zip(x, y):
+            if ast.dump(p) == ast.dump(q):
+                continue
+            if isinstance(p, ast.ClassDef):
+                walk(p.body, q.body, f"{qual}.{p.name}" if qual else p.name)
+            elif isinstance(p, (ast.Assign, ast.AnnAssign, ast.FunctionDef, ast.AsyncFunctionDef)):
+                for nm in names_of(p):
+                    items.append(("c", mod, qual, nm) if qual else ("m", mod, nm))
+            elif isinstance(p, ast.Expr):
+                continue  # a docstring
+            elif isinstance(p, ast.If) and not qual:
+                if ast.dump(p.test) != ast.dump(q.test):
+                    items.extend(("a", mod, nm) for nm in sorted(bound(p.body) | bound(p.orelse)))
+                    for st in [x for blk in (p.body, p.orelse) for n in blk for x in ast.walk(n)]:
+                        code = import_code(st, mod, is_pkg)
+                        if code:
+                            items.append(("i", code))
+                walk(p.body, q.body, qual)
+                walk(p.orelse, q.orelse, qual)
+            elif isinstance(p, (ast.Try, ast.With)) and not qual:
+                for f in ("body", "orelse", "finalbody"):
+                    walk(getattr(p, f, []), getattr(q, f, []), qual)
+                for hp, hq in zip(getattr(p, "handlers", []), getattr(q, "handlers", [])):
+                    walk(hp.body, hq.body, qual)
+            else:
+                items.append(("?", mod, qual, type(p).__name__))
+    walk(a.body, b.body, "")
+    return None if any(i[0] == "?" for i in items) else items
 
 
-def cls_static(tq, triples):
-    """Lower bound of what cls_check will find for these directly edited class attributes [(module, class qualname,
-    name)]: a reason it will refuse, or the CPU seconds its queries will cost at least (0.0: none)."""
-    names, cls, tnames = tq["names"], tq["cls"], set(tq["tnames"])
-    p_m = o_m = g_m = d_m = e_m = 0
-    for mod, qual, name in triples:
-        if name.startswith("__") or name.endswith("_sql") or name in tnames:
+def name_masks(tq, item):
+    """Stage masks of the lines test_execute_tpcds runs (inside functions) that can read this edited name, or a
+    reason to refuse. Class entries: only if the test reads that class's attribute at run time (map class table),
+    then every line reading `.NAME` or the string "NAME". Module globals: that module's lines reading the bare NAME,
+    and `.NAME` / "NAME" anywhere (module attribute reads, getattr by literal)."""
+    names, cls, tnames, bnames = tq["names"], tq["cls"], set(tq["tnames"]), tq.get("bnames", {})
+    if item[0] == "c":
+        _, mod, qual, name = item
+        if not qual or name.startswith("__") or name.endswith("_sql") or name in tnames:
             return f"attribute the check cannot follow: {qual}.{name}"
         if cls.get(f"{mod}|{qual}|{name}") == 0:
-            continue
-        row = names.get(name)
-        if row is None:
-            continue
-        p, o, g, d, s, e = row
-        if s:
-            return f"read while the tables are built: {qual}.{name}"
+            return [0] * 6
+        return list(names.get(name) or [0] * 6)
+    _, mod, name = item
+    if name.startswith("__") or name in tnames:
+        return f"global the check cannot follow: {mod}.{name}"
+    if "anames" not in tq:  # an older map: every `.NAME` read anywhere
+        a, b = names.get(name) or [0] * 6, bnames.get(f"{mod}|{name}") or [0] * 6
+        return [x | y for x, y in zip(a, b)]
+    # The module's own lines reading the bare name; `X.NAME` where X is a name the module is imported under (or a
+    # package alias plus the rest of its dotted name); `.NAME` on anything that is not a chain of names; "NAME".
+    an, malias = tq["anames"], tq["malias"]
+    chains = set(malias.get(mod, [mod]))
+    parts = mod.split(".")
+    for i in range(1, len(parts)):
+        rest = ".".join(parts[i:])
+        chains |= {f"{al}.{rest}" for al in malias.get(".".join(parts[:i]), [])}
+    rows = [bnames.get(f"{mod}|{name}"), tq["snames"].get(name), an.get(f"?|{name}")] +         [an.get(f"{c}|{name}") for c in chains]
+    out = [0] * 6
+    for r in rows:
+        if r:
+            out = [x | y for x, y in zip(out, r)]
+    return out
+
+
+def mask_est(tq, rows):
+    """CPU seconds of the queries these stage masks need (0.0: none), or a reason to refuse."""
+    p_m = o_m = g_m = d_m = e_m = 0
+    for r in rows:
+        if isinstance(r, str):
+            return r
+        p, o, g, d, st, e = r
+        if st:
+            return "read while the tables are built"
         p_m, o_m, g_m, d_m, e_m = p_m | p, o_m | o, g_m | g, d_m | d, e_m | e
     q1 = (p_m & tq["exec_mask"]) | o_m | g_m
     if (q1 | d_m) & tq["unstable_mask"]:
@@ -1523,7 +1635,7 @@ def cls_job(m, patch_text, tp):
                 return None
         if old != new or old is None:
             return None
-    files, nonbody, triples = {}, False, []
+    files, nonbody, triples, probes = {}, False, [], []
     for old, new, blocks in entries:
         path = old
         if not path.startswith("sqlglot/"):
@@ -1536,22 +1648,24 @@ def cls_job(m, patch_text, tp):
             if changed_bodies(text, new_text) != []:
                 return None  # a function body (or something unparsable) changed: not this check's case
         else:
-            if not class_values_only(text, new_text):
-                return None
-            pairs = class_value_changes(text, new_text)
-            if pairs is None:
-                return None
             mod = path[:-3].replace("/", ".")
             mod = mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
-            triples += [(mod, q, n) for q, n in pairs]
+            its = static_items(text, new_text, mod, path.endswith("/__init__.py"))
+            if its is None:
+                return None
+            probes += [i[1] for i in its if i[0] == "i"]
+            if any(i[0] == "i" for i in its):
+                probes.append(f"import {mod}")
+            triples += [i for i in its if i[0] in ("c", "m")]  # flipped-if names: the state check decides
             nonbody = True
         files[path] = new_text
     if not files or not nonbody:
         return None
-    q_est = cls_static(tq, triples)
+    q_est = mask_est(tq, [name_masks(tq, it) for it in triples])
     if isinstance(q_est, str) or q_est > CHECK_MAX_EST_S:
         return None  # the check would refuse, or its queries alone would cost more than one check may
-    return {"kind": "cls", "files": files, "est": SNAP_EST_S + q_est}
+    return {"kind": "cls", "files": files, "est": SNAP_EST_S + q_est + PROBE_EST_S * len(set(probes)),
+            "probe": sorted(set(probes))}
 
 
 def cls_check():
@@ -1561,40 +1675,64 @@ def cls_check():
     t_start = time.process_time()
     tmp = patched_tree(job["files"])
     try:
+        for code in job.get("probe", []):
+            # Each statement first thing after `import sqlglot`, in a fresh process: an import that a flipped
+            # TYPE_CHECKING block now runs can close a cycle that only some import orders hit.
+            pr = subprocess.run([sys.executable, "-s", "-P", "-c",
+                                 "import sys; sys.path.insert(0, sys.argv[1]); import sqlglot; exec(sys.argv[2])",
+                                 tmp, code], env=snap_env(), cwd="/tmp", capture_output=True, text=True, timeout=60)
+            if pr.returncode:
+                print("import probe failed:", code, pr.stderr.strip().splitlines()[-1:] or "")
+                return 1
         diffs = state_diff(tmp)
         if isinstance(diffs, str):
             print(diffs)
             return 1
         m = Map(MAP)
         tq = m.d["tpq"]
-        names, cls, tnames = tq["names"], tq["cls"], set(tq["tnames"])
+        builtin_names = set(dir(__import__("builtins")))
         p_m = o_m = g_m = d_m = e_m = 0
         seen = []
         for k, a, b in diffs:
-            # Only class dict entries carry tag V (module globals G, structure S, classes T, callables F, errors E).
-            if a is None or b is None or a[1] != "V" or b[1] != "V" or "::" in k or k.startswith("IMPORTERROR"):
-                print("not a plain class attribute value:", k, a and a[1], b and b[1])
+            rec = b or a
+            t, mod, qual = rec[1], rec[2], rec[3]
+            if k.startswith("IMPORTERROR"):
+                print("import error:", k)
                 return 1
-            mod, qual = b[2], b[3]
-            name = k.rsplit(".", 1)[1]
-            if not qual or name.startswith("__") or name.endswith("_sql") or name in tnames:
-                print("attribute the check cannot follow:", k)
+            if k.endswith("::order") and t == "S" and not qual and k[: -len("::order")] == mod:
+                continue  # the order of a module's globals (names added or moved): nothing reads it at run time
+            if "::" in k:
+                print("class structure changed:", k)
                 return 1
-            seen.append(f"{qual}.{name}")
-            if cls.get(f"{mod}|{qual}|{name}") == 0:
-                continue  # the test never reads this class's attribute at run time
-            row = names.get(name)
-            if row is None:
-                continue  # no line the test runs reads the name
-            p, o, g, d, s, e = row
-            if s:
+            if qual and t in ("V", "F"):  # a class dict entry: a value, a method or a descriptor
+                if a is None or b is None or a[1] != b[1]:
+                    print("class entry added, removed or changed kind:", k)
+                    return 1
+                item = ("c", mod, qual, k.rsplit(".", 1)[1])
+            elif not qual and t in ("G", "GF", "GT", "GM") and k.startswith(mod + ":"):
+                name = k[len(mod) + 1:]
+                if a is None:
+                    # A global that did not exist (a TYPE_CHECKING import now made): no code could read it before
+                    # without failing, unless the name is a builtin it now shadows.
+                    if name in builtin_names or name.startswith("__"):
+                        print("new global shadows a builtin:", k)
+                        return 1
+                    seen.append(f"+{mod}.{name}")
+                    continue
+                item = ("m", mod, name)
+            else:
+                print("not a followed kind:", k, a and a[1], b and b[1])
+                return 1
+            r = name_masks(tq, item)
+            if isinstance(r, str):
+                print(r)
+                return 1
+            seen.append(".".join(x for x in item[1:] if x))
+            p, o, g, d, st, e = r
+            if st:
                 print("read while the tables are built:", k)
                 return 1
-            p_m |= p
-            o_m |= o
-            g_m |= g
-            d_m |= d
-            e_m |= e
+            p_m, o_m, g_m, d_m, e_m = p_m | p, o_m | o, g_m | g, d_m | d, e_m | e
         ex = tq["exec_mask"]
         q1 = (p_m & ex) | o_m | g_m
         pn = p_m & ~ex
