@@ -203,6 +203,14 @@ class Map:
             self._sets[sid] = s
         return s
 
+    def lams(self, path):
+        """[[lineno, col, end_lineno, body_lineno, body_end_lineno, sid, load]] for the lambdas written outside
+        functions (see lambda_price)."""
+        key = (path, "lam")
+        if key not in self._blocks:
+            self._blocks[key] = json.loads(self.d["files"][path].get("lam", "[]"))
+        return self._blocks[key]
+
     def spans(self, path, kind):
         key = (path, kind)
         if key not in self._spans:
@@ -474,6 +482,76 @@ def select_sqlglot(m, path, blocks):
     return sel
 
 
+def outer_lambdas(tree):
+    """Lambdas written outside any function, in source order (a lambda inside one belongs to the outer one)."""
+    out = []
+
+    def visit(node, in_func):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(ch, True)
+            elif isinstance(ch, ast.Lambda):
+                if not in_func:
+                    out.append(ch)
+                visit(ch, True)
+            else:
+                visit(ch, in_func)
+    visit(tree, False)
+    return out
+
+
+def lambda_price(m, path, blocks):
+    """Tests for an edit confined to the bodies of lambdas written outside functions (dispatch tables such as
+    TRANSFORMS): a lambda's body runs only when something calls it, and the callers do not change, so a test that never
+    ran a line of the old body (traced test by test, each in its own process) runs the same code on the new one.
+    None (price as before) when anything else changes, a changed lambda ran while a module or class body was loading,
+    or a body yields or awaits (a call would not run it)."""
+    rows = m.lams(path)
+    if not rows:
+        return None
+    spans = [(r[3], r[4]) for r in rows]
+    for removed, added, _ in blocks:
+        if not removed or len(removed) != len(added):
+            return None  # lines added or removed: positions move
+        for ln, _t in removed:
+            if not any(s <= ln <= e for s, e in spans):
+                return None
+    old = m.source(path)
+    new = patched(old, blocks) if old is not None else None
+    if new is None:
+        return None
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return None
+    la, lb = outer_lambdas(a), outer_lambdas(b)
+    if len(la) != len(lb):
+        return None
+    by_pos = {(r[0], r[1]): r for r in rows}
+    sel, changed = 0, False
+    for x, y in zip(la, lb):
+        if (x.lineno, x.end_lineno, x.body.lineno, x.body.end_lineno) != \
+                (y.lineno, y.end_lineno, y.body.lineno, y.body.end_lineno):
+            return None
+        if ast.dump(x.body) == ast.dump(y.body):
+            continue
+        r = by_pos.get((x.lineno, x.col_offset))
+        if r is None or r[6]:
+            return None
+        if any(isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await)) for t in (x.body, y.body) for n in ast.walk(t)):
+            return None
+        sel |= m.set(r[5])
+        changed = True
+    if not changed:
+        return None
+    for t in (la, lb):
+        for lam in t:
+            lam.body = ast.Constant(None)
+    if ast.dump(a) != ast.dump(b):
+        return None  # something outside the bodies changed too
+    return sel
+
+
 def select_testfile(m, path, blocks):
     spans = Spans(m.d["testfiles"].get(path, []))
     sel = 0
@@ -639,7 +717,8 @@ def select(m, patch_text):
             if new is None or (new and new != old):
                 sel |= m.set(m.d["files"][path]["importers"])
                 continue
-            sel |= select_sqlglot(m, path, blocks)
+            lam = lambda_price(m, path, blocks)
+            sel |= lam if lam is not None else select_sqlglot(m, path, blocks)
         elif path.startswith("tests/") and path.endswith(".py") and path in m.d["testfiles"] and old is not None:
             sel |= select_testfile(m, path, blocks)
         elif path.startswith("tests/"):
