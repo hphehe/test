@@ -686,6 +686,64 @@ def breaks_syntax(m, old, new, blocks):
     return False
 
 
+_ANN_LINE = re.compile(r"^\s*[A-Za-z_][\w.]*(\[[^\]]*\])?\s*:(?!=)\s*\S")
+_BLOCK_WORDS = ("def ", "async ", "class ", "if ", "elif ", "else", "try", "except", "finally", "with ", "for ",
+                "while ", "match ", "case ", "return", "lambda", "@")
+_ODD_BASES = {"NamedTuple", "TypedDict", "Protocol", "Generic", "BaseModel", "Struct"}
+
+
+def annotations_only(m, path, blocks):
+    """True when an in-place edit of a sqlglot module changes nothing but the annotations of NAME: T (= ...)
+    statements that are never evaluated: inside functions (local annotations are not evaluated at all), and in the
+    module body or the bodies of undecorated plain classes when the module has `from __future__ import annotations`
+    (strings in __annotations__, which sqlglot reads only through its dataclasses)."""
+    lines = [t for b in blocks for _, t in b[0]] + [t for b in blocks for t in b[1]]
+    if not lines or any(len(b[0]) != len(b[1]) for b in blocks):
+        return False
+    for t in lines:
+        st = t.lstrip()
+        if not _ANN_LINE.match(t) or st.startswith(_BLOCK_WORDS):
+            return False
+    src = m.source(path)
+    new = patched(src, blocks) if src is not None else None
+    if new is None:
+        return False
+    try:
+        a, b = ast.parse(src), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return False
+
+    def future(t):
+        return any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and any(x.name == "annotations"
+                                                                                       for x in n.names) for n in t.body)
+    deferred = future(a) and future(b)
+
+    def blank(body, in_def):
+        for st in body:
+            if isinstance(st, ast.AnnAssign) and (in_def or deferred):
+                st.annotation = ast.Constant(None)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                blank(st.body, True)
+            elif isinstance(st, ast.ClassDef):
+                plain = not st.decorator_list and not st.keywords and not any(
+                    (x.id if isinstance(x, ast.Name) else x.attr if isinstance(x, ast.Attribute) else "?") in _ODD_BASES
+                    or not isinstance(x, (ast.Name, ast.Attribute)) for x in st.bases)
+                if plain:
+                    blank(st.body, False)
+            for f in ("orelse", "finalbody"):
+                if not isinstance(st, ast.ClassDef) and isinstance(getattr(st, f, None), list):
+                    blank(getattr(st, f), in_def)
+            if isinstance(st, (ast.If, ast.Try, ast.With, ast.For, ast.While, ast.AsyncFor, ast.AsyncWith)):
+                blank(st.body, in_def)
+            for hd in getattr(st, "handlers", []):
+                blank(hd.body, in_def)
+    if ast.dump(a) == ast.dump(b):
+        return False  # no change in the code at all: the other rules see it
+    blank(a.body, False)
+    blank(b.body, False)
+    return ast.dump(a) == ast.dump(b)
+
+
 def select(m, patch_text):
     sel = 0
     # In-place edits of the TPC-H / TPC-DS query files: only the TestExecutor tests whose inputs changed (see
@@ -745,6 +803,8 @@ def select(m, patch_text):
             if new is None or (new and new != old):
                 sel |= m.set(m.d["files"][path]["importers"])
                 continue
+            if annotations_only(m, path, blocks):
+                continue  # (the tests that read the file as text are in already)
             lam = lambda_price(m, path, blocks)
             sel |= lam if lam is not None else select_sqlglot(m, path, blocks)
         elif path.startswith("tests/") and path.endswith(".py") and path in m.d["testfiles"] and old is not None:
@@ -1843,6 +1903,8 @@ def key_snap_main(argv):
         r = {"why": f"snapshot failed: {exc!r}"}
     else:
         r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats})
+        if "why" not in r:
+            r["values"] = diff_values(r)
     with open(out, "w") as fh:
         json.dump(r, fh)
     os._exit(0)  # no interpreter teardown
@@ -2017,6 +2079,8 @@ def key_server_main(argv):
                 keys, bags, stats = snap_state(root, base["unstable"], want, roots=group, errs=new_errs)
                 scope = {k for m in group for k in by_root.get(m, ())} | {DIALECT_TABLE}
                 r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats}, scope)
+                if "why" not in r:
+                    r["values"] = diff_values(r)
                 with open(job["out"], "w") as fh:
                     json.dump(r, fh)
                 code = 0
@@ -2163,6 +2227,121 @@ def key_job(m, text):
         else:
             return None
     return {"files": files, "data": data} if real else None
+
+
+# Set plans. When the key check of a commit finds that every import-time difference is a plain value (None, bool,
+# number, str, bytes, and tuples, lists, dicts and sets of those) held by a sqlglot module global or by a class's own
+# namespace, its child also hands back those values. A forked run child can then set them on the objects the runner
+# parent imported instead of importing the patched tree again (a hot plan without code pairs).
+_SET_PLANS = {}  # commit -> [(module, class path, name, value)]
+_TEST_SOURCES = []
+
+
+def _plain(v, depth=0):
+    if depth > 6:
+        return False
+    if v is None or type(v) in (bool, int, str, bytes) or (type(v) is float and v == v and abs(v) != float("inf")):
+        return True
+    if type(v) in (tuple, list, set):
+        return all(_plain(x, depth + 1) for x in v)
+    if type(v) is dict:
+        return all(_plain(k, depth + 1) and _plain(x, depth + 1) for k, x in v.items())
+    return False
+
+
+def diff_values(r):
+    """In a key-check child, after key_diff: {key: repr of the new value} for every changed key that holds a plain
+    value as a module global or in a class's own namespace (reached as module.qualname), where the repr reads back
+    equal; keys that cannot be handed back are left out."""
+    out = {}
+    for k, mod, gone, _, b in r.get("diffs", ()):
+        if gone or b is None or b[1] not in ("V", "G"):
+            continue
+        mo = sys.modules.get(b[2])
+        if mo is None:
+            continue
+        if b[1] == "G":
+            if not k.startswith(b[2] + ":"):
+                continue
+            holder, name = vars(mo), k[len(b[2]) + 1:]
+        else:
+            head = f"{b[2]}.{b[3]}."
+            name = k[len(head):]
+            if not b[3] or not k.startswith(head) or "." in name:
+                continue
+            o = mo
+            for q in b[3].split("."):
+                o = getattr(o, q, None)
+            if not isinstance(o, type) or o.__module__ != b[2] or o.__qualname__ != b[3]:
+                continue
+            holder = o.__dict__
+        if name not in holder or not _plain(holder[name]):
+            continue
+        try:
+            text = repr(holder[name])
+            if len(text) > 200000 or ast.literal_eval(text) != holder[name]:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        out[k] = text
+    return out
+
+
+def read_at_import(names):
+    """True when a tests/ .py file names one of `names` outside every def (module level, class bodies, decorators,
+    default values): its import, which the runner parent did with the old values, may have read it."""
+    if not _TEST_SOURCES:
+        for root, _, files in os.walk(os.path.join(ST, "tests")):
+            for nm in files:
+                if nm.endswith(".py"):
+                    try:
+                        with open(os.path.join(root, nm), encoding="utf-8", errors="replace") as fh:
+                            _TEST_SOURCES.append(fh.read())
+                    except OSError:
+                        return True
+        _TEST_SOURCES.append("")
+    pat = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b")
+    for text in _TEST_SOURCES:
+        if not pat.search(text):
+            continue
+        lines = text.split("\n")
+        for i, line in enumerate(lines):
+            if not pat.search(line):
+                continue
+            ind, in_def = len(line) - len(line.lstrip()), False
+            for j in range(i - 1, -1, -1):
+                st = lines[j].lstrip()
+                if not st or st.startswith("#"):
+                    continue
+                k = len(lines[j]) - len(st)
+                if k < ind:
+                    if st.startswith(("def ", "async def ")):
+                        in_def = True
+                        break
+                    if k == 0:
+                        break
+                    ind = k
+            if not in_def:
+                return True
+    return False
+
+
+def set_plan(r):
+    """[(module, class path, name, value)] for a key check whose every difference was handed back, or
+    None."""
+    vals = r.get("values") or {}
+    out = []
+    for k, mod, gone, _, b in r["diffs"]:
+        if gone or k not in vals:
+            return None
+        v = ast.literal_eval(vals[k])
+        if b[1] == "G":
+            out.append((b[2], (), k[len(b[2]) + 1:], v))
+        else:
+            out.append((b[2], tuple(b[3].split(".")), k[len(b[2]) + len(b[3]) + 2:], v))
+    if not out or read_at_import({x[2] for x in out}):
+        return None
+    return out
 
 
 def key_check():
@@ -2947,6 +3126,7 @@ PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 RUN_DEADLINE_S = float(os.environ.get("BR_RUN_WALL", 150))  # no child runs past this many seconds of the run
 HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, RUN_SHARE * (2 s + its recorded seconds))
 RUN_SHARE = 0.7
+RUN_LEVELS_S = [0.0, 0.5, 1.0, 2.0, 4.0]  # smaller run sets weighed against the budget's (classmates only at 0)
 HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of test runs per commit
 FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
 FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
@@ -3501,6 +3681,17 @@ def child_run(plan, order, tests, wfd, idx, skip_after, red=None):
                     f.__code__ = y
             for x, y in plan["pairs"]:
                 codes += all_codes(y)
+            for mod, path, name, val in plan.get("sets", ()):
+                o = sys.modules.get(mod)
+                if o is None:
+                    continue  # not imported yet: the patched text is served when it is
+                for q in path:
+                    o = getattr(o, q, None)
+                if path and (not isinstance(o, type) or o.__module__ != mod or o.__qualname__ != ".".join(path) or
+                             type(o).__setattr__ is not type.__setattr__):
+                    put("X an edited constant has no plain class")
+                    os._exit(0)
+                setattr(o, name, val)
         py = {p: t for p, t in files.items() if p.endswith(".py")}
         if py:
             sys.meta_path.insert(0, _PatchedFinder(py))
@@ -4050,32 +4241,52 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
     run = [n for n in cands if runnable(n) and (n in protect or
                                                 cost(n) <= max(HOLD_FLOOR_S, RUN_SHARE * (WORKER_MS / 1000 + ms[n] / 1000)))]
     budget = HOT_BUDGET_S if plan["mode"] == "hot" else FRESH_BUDGET_S
-    if sum(cost(n) for n in run if n not in protect) > budget:
+    # The run sets weighed: the classmates plus the tests with the best recorded-to-CPU ratio up to each CPU level
+    # (the last level is the budget, which takes them all when they fit).
+    ranked = sorted((n for n in run if n not in protect), key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002))
+    options, seen = [], set()
+    for lv in [x for x in RUN_LEVELS_S if x < budget] + [budget]:
         keep, acc = set(), 0.0
-        for n in sorted(run, key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002)):
-            if n not in protect and acc + cost(n) <= budget:
+        for n in ranked:
+            if acc + cost(n) <= lv:
                 acc += cost(n)
                 keep.add(n)
-        run = [n for n in run if n in keep or n in protect]
-    if not run:
+        r = [n for n in run if n in keep or n in protect]
+        if r and frozenset(r) not in seen:
+            seen.add(frozenset(r))
+            options.append(r)
+    if not options:
         return None
     full = sim_cost(cands, ms)
-    rest = [n for n in cands if n not in set(run)]
-    gain = full - sim_cost(rest, ms)
     mates = sorted(protect)
-    if mates:
-        gain = MATE_P * (full - sim_cost([n for n in rest if n != tp], ms)) + (1 - MATE_P) * gain
-    spend = spend_of(run)
-    if gain <= spend:
-        return None  # even if every run passes, the answer shrinks by less than the runs cost
+    scored = []
+    for r in options:
+        rs = set(r)
+        rest = [n for n in cands if n not in rs]
+        gain = full - sim_cost(rest, ms)
+        if mates:
+            gain = MATE_P * (full - sim_cost([n for n in rest if n != tp], ms)) + (1 - MATE_P) * gain
+        scored.append((gain - spend_of(r), gain, spend_of(r), r, rest))
+    scored.sort(key=lambda x: -x[0])
     # Most commits fail some candidate, and a failing test stays with its worker: expect the all-pass gain only with
-    # RUN_CLEAN_P, else the gain left when one test that runs fails (averaged over up to 16 of them).
-    fs = sorted(run, key=lambda n: (ms[n], n))
-    if len(fs) > 16:
-        fs = [fs[i * (len(fs) - 1) // 15] for i in range(16)]
-    one = sum(full - sim_cost(rest + [f], ms) for f in fs) / len(fs)
-    if RUN_CLEAN_P * gain + (1 - RUN_CLEAN_P) * max(0.0, one) <= spend:
+    # RUN_CLEAN_P, else the gain left when one test that runs fails (averaged over up to 16 of them). The all-pass
+    # margin bounds the expected one, so the options go best margin first until none can win.
+    best = None
+    for margin, gain, spend, r, rest in scored:
+        if margin <= 0 or (best is not None and margin <= best[0]):
+            break
+        fs = sorted(r, key=lambda n: (ms[n], n))
+        if len(fs) > 16:
+            fs = [fs[i * (len(fs) - 1) // 15] for i in range(16)]
+        one = sum(full - sim_cost(rest + [f], ms) for f in fs) / len(fs)
+        net = RUN_CLEAN_P * gain + (1 - RUN_CLEAN_P) * max(0.0, one) - spend
+        if net > 0 and (best is None or net > best[0]):
+            best = (net, r, spend)
+    if best is None:
+        _log(f"run_choice: no run set expected to save more than it costs (best margin {scored[0][0]:.2f}, "
+             f"{len(options)} options, {len(protect)} classmates)")
         return None
+    _, run, spend = best
     skip_after = {n for n in run if cost(n) > max(0.03, AFTER_FAIL * ms[n] / 1000)}
     first = {}
     for n in sorted(run):
@@ -4142,6 +4353,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     for c, cands, text in work:
         try:
             plan = run_plan(m, text)
+            if plan and plan["mode"] == "fresh" and c in _SET_PLANS and all(p.endswith(".py") for p in plan["files"]):
+                plan = dict(plan, mode="hot", pairs=[], sets=_SET_PLANS[c])
             if plan and plan["mode"] == "fresh":
                 plan["group"] = fresh_group(plan, graph)
             if plan and c in checks:
@@ -4153,6 +4366,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
             continue
         if ch is not None:
             jobs.append([c, cands, plan, ch, red])
+        else:
+            _log(c, "no run:", "no plan" if not plan else f"{plan['mode']} {len(cands)} candidates")
     if not jobs:
         return {}, set()
     for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
@@ -4214,7 +4429,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     kept = make_immortal()
     _log(f"immortal {kept} objects, {time.process_time() - t_imm:.3f} s CPU")
     gc.freeze()
-    _LIVE.update(idx=idx, plans={c: p for c, p in plans.items() if p["mode"] == "hot" and c not in hit and not any(
+    _LIVE.update(idx=idx, plans={c: p for c, p in plans.items() if p["mode"] == "hot" and not p.get("sets")
+                                 and c not in hit and not any(
         os.path.join(ST, f) in opened for f in p["files"] if not f.endswith(".py"))})
     out, tp_ok = {}, set()
     jobs.sort(key=lambda j: j[3][4])
@@ -4466,6 +4682,15 @@ def key_phase(m, tests, ms, rows, out):
         out[stem] = [n for n in out[stem] if n in keep]
         if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
             no_run.add(stem)
+        elif r["diffs"] and not os.environ.get("BR_NO_SET"):
+            try:
+                sp = set_plan(r)
+            except Exception as exc:  # noqa: BLE001
+                _log(stem, "set plan:", repr(exc))
+                sp = None
+            if sp:
+                _SET_PLANS[stem] = sp
+            _log(stem, "set plan:" if sp else "no set plan:", [d[0] for d in r["diffs"]][:8])
         print(f"{stem}: key check keeps {len(out[stem])} of {before} ({len(r['diffs'])} changed)", file=sys.stderr)
     return no_run
 
