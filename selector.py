@@ -2481,6 +2481,10 @@ def key_job(m, text):
 SET_PLANS = os.environ.get("BR_SET") == "1"
 _SET_PLANS = {}  # commit -> [(module, class path, name, value)]
 _MATE_FAILED = set()  # commits where a classmate of test_execute_tpcds failed in the run
+_HOW = {}  # commit -> how its tests were decided (readout only): runner mode / "declined" / "doubt" / ...
+_KEYED = {}  # commit -> "n" narrowed by the key check, "a" kept all, "b" a module no longer imports
+_TPC = {}  # commit -> "k" the TPC-DS check kept the test, "d" dropped it, "f" its job was filtered out
+_MATES_RAN = set()  # commits whose run held a classmate of test_execute_tpcds
 _TEST_SOURCES = []
 
 
@@ -4739,6 +4743,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         if ch is not None:
             jobs.append([c, cands, plan, ch, red])
         else:
+            _HOW[c] = "noplan" if not plan else "declined"
             _log(c, "no run:", "no plan" if not plan else f"{plan['mode']} {len(cands)} candidates")
     if not jobs:
         return {}, set()
@@ -4795,6 +4800,9 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         elif j[4] and not filtered:
             j[4] = {}
             j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
+    for j in jobs:
+        if j[3] is None:
+            _HOW[j[0]] = "declined"
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     t_imm = time.process_time()
@@ -4809,6 +4817,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     for c, cands, plan, (run, skip_after, allowed, cap, spend, mates), red in jobs:
         left = t_start + RUN_DEADLINE_S - time.monotonic()
         if left < 5.0:
+            _HOW.setdefault(c, "late")
             break
         try:
             exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
@@ -4851,13 +4860,19 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
                               file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001
             _log(c, "run:", repr(exc))
+            _HOW[c] = "error"
             continue
         if doubt:
             _log(c, plan["mode"], "doubt:", doubt)
+            _HOW[c] = "doubt"
             continue
+        _HOW[c] = "warm" if plan["mode"] == "fresh" and plan.get("group") else plan["mode"]
+        if mates_all and any(mates_all >> n & 1 for n in verdicts):
+            _MATES_RAN.add(c)
         passed = {n for n, (code, reached, _) in verdicts.items()
                   if code == 0 and (reached or not exp_mask >> n & 1)}
         out[c] = passed
+        _SEEN_FAIL[c] = {n for n, v in verdicts.items() if v[0] == 1}
         failing = [n for n, v in verdicts.items() if v[0] == 1]
         if any(mates_all >> n & 1 for n in failing):
             _MATE_FAILED.add(c)
@@ -4972,12 +4987,16 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     if not order:
         order = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
-    lines = []
+    answers = {}
     for stem in order:
         chosen = out.get(stem)
-        if chosen is None:
-            chosen = list(ms)
-        lines.append(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
+        answers[stem] = pack(list(ms) if chosen is None else chosen, ms)
+    if READOUT:
+        try:
+            readout(answers, ms, tests)
+        except Exception as exc:  # noqa: BLE001
+            print(f"readout: {exc!r}", file=sys.stderr)
+    lines = [json.dumps({"commit": stem, "workers": answers[stem]}) for stem in order]
     data = ("\n".join(lines) + "\n").encode() if lines else b""
     while data:
         data = data[os.write(ans_fd, data):]
@@ -4990,6 +5009,93 @@ def main():
     print(f"done: {time.monotonic() - t_start:.1f} s wall, {sum(os.times()[:4]):.2f} s CPU {cg}", file=sys.stderr)
     sys.stderr.flush()
     os._exit(0)  # no interpreter teardown (it only costs CPU)
+
+
+# Measurement build only (None in every scored entry): one commit whose answer is empty gets a single worker of tests
+# whose recorded milliseconds add up to a number about this batch, so the simulated total tells it.
+READOUT = True
+_SEEN_FAIL = {}  # commit -> tests that failed in its run
+
+
+_HOW_CODE = {"hot": 0, "warm": 1, "fresh": 2, "declined": 3}
+
+
+def readout_value(answers, ms, tests, which):
+    """A 14-bit number about this batch (measurement build only). which (drawn per run):
+      0  the commit with the most seconds beyond what its tests seen failing here cost, test_execute_tpcds left
+         out of the count: those seconds in 128 ms units (8 bits), how it was decided (3 bits, below), its key
+         check (2 bits: 0 none, 1 narrowed, 2 kept all, 3 a module no longer imports), 1 bit: a test failed in its run
+      1, 2  the commit where test_execute_tpcds, in the answer without a failure seen, adds the most / the second
+         most seconds: those seconds in 512 ms units (6 bits), how it was decided (3 bits), a classmate ran (1), a
+         classmate failed (1), its TPC-DS check (2 bits: 0 none, 1 job filtered out, 2 ran and kept the test),
+         1 bit: a key check ran
+      3  commits with test_execute_tpcds unseen failing (2 bits), commits where a module no longer imports (2),
+         empty answers (3 bits), all seconds beyond the tests seen failing in 1 s units (7 bits)
+    How a commit was decided: 0 hot run, 1 warm run, 2 fresh run, 3 runs declined, 4 a module no longer imports,
+    5 no run otherwise, 6 run doubted or failed, 7 out of time."""
+    def cost(ws):
+        ws = [w for w in ws if w]
+        return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
+
+    def how(c):
+        h = _HOW.get(c)
+        if h in _HOW_CODE:
+            return _HOW_CODE[h]
+        if _KEYED.get(c) == "b":
+            return 4
+        return 6 if h in ("doubt", "error", "noplan") else 7 if h == "late" else 5
+    tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
+    cap = lambda v, top: max(0, min(top, int(round(v))))  # noqa: E731
+    waste, tpw = [], []
+    for c, ws in answers.items():
+        chosen = [t for w in ws for t in w]
+        seen = _SEEN_FAIL.get(c, set())
+        rest = [t for t in chosen if t != tp or tp in seen]
+        waste.append((cost(pack(rest, ms)) - cost(pack([t for t in rest if t in seen], ms)), c))
+        if len(rest) < len(chosen):
+            tpw.append((cost(ws) - cost(pack(rest, ms)), c))
+    waste.sort(key=lambda r: (-r[0], r[1]))
+    tpw.sort(key=lambda r: (-r[0], r[1]))
+    key_code = {"n": 1, "a": 2, "b": 3}
+    if which == 0:
+        if not waste or waste[0][0] <= 0:
+            return 0
+        w, c = waste[0]
+        return cap(w / 128, 255) << 6 | how(c) << 3 | key_code.get(_KEYED.get(c), 0) << 1 | int(bool(_SEEN_FAIL.get(c)))
+    if which in (1, 2):
+        if len(tpw) < which:
+            return 0
+        w, c = tpw[which - 1]
+        return (cap(w / 512, 63) << 8 | how(c) << 5 | int(c in _MATES_RAN) << 4 | int(c in _MATE_FAILED) << 3
+                | {"f": 1, "k": 2}.get(_TPC.get(c), 0) << 1 | int(c in _KEYED))
+    total = sum(r[0] for r in waste) + sum(r[0] for r in tpw)
+    return (cap(len(tpw), 3) << 12 | cap(sum(1 for v in _KEYED.values() if v == "b"), 3) << 10
+            | cap(sum(1 for ws in answers.values() if not any(ws)), 7) << 7 | cap(total / 1000, 127))
+
+
+def readout(answers, ms, tests):
+    which = int(os.environ["BR_READOUT_M"]) % 4 if os.environ.get("BR_READOUT_M") else os.urandom(1)[0] % 4
+    value = readout_value(answers, ms, tests, which)
+    target = 50 + 4 * value + which  # milliseconds on one added worker
+    stem = next((c for c in sorted(answers) if not any(answers[c])), None)
+    if stem is None:
+        print("readout: no empty answer", file=sys.stderr)
+        return
+    nums = sorted(n for n in ms if ms[n] > 0)
+    reach = [1]  # reach[i] has bit s set when some of nums[:i] add up to s ms
+    lim = (1 << (target + 1)) - 1
+    for n in nums:
+        reach.append((reach[-1] | reach[-1] << ms[n]) & lim)
+    if not reach[-1] >> target & 1:
+        print(f"readout: {target} ms cannot be made", file=sys.stderr)
+        return
+    picked, left = [], target
+    for i in range(len(nums) - 1, -1, -1):
+        if left and not reach[i] >> left & 1:
+            picked.append(nums[i])
+            left -= ms[nums[i]]
+    answers[stem] = [sorted(picked)]
+    print(f"readout which {which} value {value} target {target} ms on {stem}", file=sys.stderr)
 
 
 def key_phase(m, tests, ms, rows, out):
@@ -5041,8 +5147,10 @@ def key_phase(m, tests, ms, rows, out):
     res.update(run_key_checks(fresh, t0))
     for stem, r in res.items():
         if not r or "why" in r:
+            _KEYED[stem] = "a"
             print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
             continue
+        _KEYED[stem] = "a"
         keep = key_readers(m, r["diffs"], r["by_key"], r.get("shadow"), jobs[stem].get("renames"))
         if isinstance(keep, str):
             print(f"{stem}: key check keeps all: {keep}", file=sys.stderr)
@@ -5054,7 +5162,9 @@ def key_phase(m, tests, ms, rows, out):
                 keep.update(n for n in out[stem] if mask >> n & 1)
         before = len(out[stem])
         out[stem] = [n for n in out[stem] if n in keep]
+        _KEYED[stem] = "n"
         if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
+            _KEYED[stem] = "b"
             no_run.add(stem)
         elif r["diffs"] and SET_PLANS:
             try:
@@ -5131,6 +5241,8 @@ def select_all(t_start):
     # The proof checks only where the runs left test_execute_tpcds in
     # ... and where no classmate failed here: on 369 labelled commits, every one with a failing classmate also
     # fails test_execute_tpcds (7 of 7), so a check there would only confirm it.
+    for k in jobs:
+        _TPC[k] = "f"
     jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run and k not in _MATE_FAILED}
     try:
         dropped = run_checks(jobs, time.time())
@@ -5139,6 +5251,7 @@ def select_all(t_start):
         dropped = {}
     _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
     for stem, ok in dropped.items():
+        _TPC[stem] = "d" if ok else "k"
         if ok:
             out[stem] = [n for n in out[stem] if n != tp]
     return [stem for stem, _, _ in rows], out
