@@ -5223,13 +5223,62 @@ def why_code(c):
     return 10 if where == "own" else 13
 
 
+def return_index(fn_name, line):
+    """Index of the return statement at this line among the returns of the selector function fn_name (source
+    order; 0 = the function ended without one)."""
+    import ast as _ast
+    src = open(os.path.abspath(__file__).replace(".pyc", ".py"), encoding="utf-8").read()
+    for n in _ast.walk(_ast.parse(src)):
+        if isinstance(n, _ast.FunctionDef) and n.name == fn_name:
+            lines = sorted({r.lineno for r in _ast.walk(n) if isinstance(r, _ast.Return)})
+            return lines.index(line) + 1 if line in lines else 0
+    return 0
+
+
+def job_reasons(m, text, tp, gain):
+    """Probe 33: which return each job builder took for this commit: (tpcds_job 5 bits, changed_bodies 3 bits
+    (its last call), cls_job 4 bits; 15 = not called)."""
+    last = {}
+
+    def tr(frame, ev, arg):
+        name = frame.f_code.co_name
+        if name in ("tpcds_job", "changed_bodies", "cls_job"):
+            if ev == "return":
+                last[name] = frame.f_lineno
+            return tr
+        return None
+    sys.settrace(tr)
+    try:
+        job = tpcds_job(m, text, tp)
+    except Exception:  # noqa: BLE001
+        job = "x"
+    finally:
+        sys.settrace(None)
+    tj = return_index("tpcds_job", last.get("tpcds_job", -1)) if job is None else (30 if job == "x" else 31)
+    cb = min(return_index("changed_bodies", last["changed_bodies"]), 7) if "changed_bodies" in last else 0
+    cl = 15
+    if job is None and gain >= SNAP_EST_S + 2:
+        last.pop("cls_job", None)
+        sys.settrace(tr)
+        try:
+            cj = cls_job(m, text, tp)
+        except Exception:  # noqa: BLE001
+            cj = "x"
+        finally:
+            sys.settrace(None)
+        cl = (min(return_index("cls_job", last.get("cls_job", -1)), 13) if cj is None else
+              (14 if cj == "x" else (12 if cj["est"] + 2 > gain else 11)))
+    print(f"readout: job reasons tj {tj} (line {last.get('tpcds_job')}) cb {cb} (line {last.get('changed_bodies')}) "
+          f"cls {cl} (line {last.get('cls_job')})", file=sys.stderr)
+    return min(tj, 31), cb, cl
+
+
 def readout_value(answers, ms, tests):
-    """Probe 32. Every run: bits 12-15 = how the TPC-DS check ended on the .py commit that keeps test_execute_tpcds
-    without a failure seen (0 no job, 1 job not run, 2 proved, 3 optimize differs over budget, 4 duckdb sql
-    differs, 5 result differs, 6 RecursionError, 7 other error, 8 live doubt, 9 timed out, 10 own-process failure,
-    11 parsed deeper, 12 no tables, 13 other). Bits 2-11 by m (drawn per run): m0 simulated seconds saved if the
-    unrun tests that really pass left the answers (0.1 s), m1 their recorded seconds (0.1 s), m2 the check job of
-    that commit: est (1 s, 4 bits), q1 / d / xq / parse-only queries present (4 bits), cls kind, live check used."""
+    """Probe 33. V = reasons << 4 | payload << 2 | m (16 bits). reasons (every run): for the .py commit that keeps
+    test_execute_tpcds without a failure seen, the return each job builder took (job_reasons: tpcds_job 5 bits,
+    changed_bodies 3 bits, cls_job 4 bits). payload (2 bits: < 1.5 s, < 4.5 s, < 7.5 s, more) by m drawn per run: the simulated
+    seconds that leaving out the unrun tests that really pass would save, m0 within 6 s of their run CPU (commits
+    by saving per CPU second), m1 on commits whose runs were declined here, m2 on commits that ran here."""
     def cost(ws):
         ws = [w for w in ws if w]
         return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
@@ -5246,20 +5295,18 @@ def readout_value(answers, ms, tests):
             if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
                 one = c
                 break
-    wc = why_code(one) if one else 15
-    print(f"readout: tpcds .py commit {one} why {wc} live {_TPC_LIVE.get(one)} job {_TPC_JOB.get(one)} "
-          f"state {_TPC.get(one)} why_text {_TPC_WHY.get(one, '')[:300]!r}", file=sys.stderr)
+    if one is None:
+        reasons = 4095
+    else:
+        chosen = [t for w in answers[one] for t in w]
+        gain = (cost(answers[one]) - cost(pack([t for t in chosen if t != tp], ms))) / 1000
+        try:
+            tj, cb, cl = job_reasons(m, _CTX["texts"][one], tp, gain)
+        except Exception as exc:  # noqa: BLE001
+            print(f"readout: job reasons {exc!r}", file=sys.stderr)
+            tj, cb, cl = 29, 0, 14
+        reasons = tj << 7 | cb << 4 | cl
     mm = int.from_bytes(os.urandom(1), "little") % 3
-    if mm == 2:
-        j = _TPC_JOB.get(one)
-        if j is None:
-            payload = 0
-        else:
-            cls, est, nq1, nd, nxq, npx = j
-            live = int(bool(_TPC_LIVE.get(one) and _TPC_LIVE[one][0] == "live"))
-            payload = min(int(est), 15) << 6 | int(nq1 > 0) << 5 | int(nd > 0) << 4 | int(nxq > 0) << 3 |                 int(npx > 0) << 2 | int(cls) << 1 | live
-        print(f"readout: m 2 payload {payload}", file=sys.stderr)
-        return wc << 12 | payload << 2 | mm
     todo = []
     for c, ws in answers.items():
         chosen = [t for w in ws for t in w]
@@ -5268,7 +5315,7 @@ def readout_value(answers, ms, tests):
         if unv:
             todo.append((-sum(ms[t] for t in unv), c, unv))
     todo.sort()
-    save = passing = 0
+    rows = []
     for _, c, unv in todo:
         if "idx" not in _LIVE or time.monotonic() - t0 > 150:
             break
@@ -5283,22 +5330,33 @@ def readout_value(answers, ms, tests):
                  and not tmap[n]["id"].startswith(NO_RUN_FILES)]
         if not order:
             continue
+        c0 = sum(os.times()[:4])
         try:
             v, status, doubt = fork_run(plan, order, tmap, _LIVE["idx"], set(), {n: 30.0 for n in order}, None,
                                         max(5.0, 165.0 - (time.monotonic() - t0)))
         except Exception as exc:  # noqa: BLE001
             print(f"readout: truth run {c}: {exc!r}", file=sys.stderr)
             continue
+        cpu = sum(os.times()[:4]) - c0
         ok = {n for n, x in v.items() if x[0] == 0}
         chosen = [t for w in answers[c] for t in w]
         gain = cost(answers[c]) - cost(pack([t for t in chosen if t not in ok], ms))
-        save += gain
-        passing += sum(ms[n] for n in ok)
+        rows.append((gain, cpu, _HOW.get(c)))
         print(f"readout {c}: unverified {len(unv)} ({sum(ms[t] for t in unv)} ms), pass {len(ok)} "
-              f"({sum(ms[n] for n in ok)} ms), saving {gain} ms, status {status}, how {_HOW.get(c)}", file=sys.stderr)
-    payload = min((save if mm == 0 else passing) // 100, 1023)
-    print(f"readout: save {save} pass {passing} m {mm} payload {payload}", file=sys.stderr)
-    return wc << 12 | payload << 2 | mm
+              f"({sum(ms[n] for n in ok)} ms), saving {gain} ms, cpu {cpu:.2f}, how {_HOW.get(c)}", file=sys.stderr)
+    declined = sum(g for g, _, h in rows if h not in ("hot", "warm", "fresh"))
+    ran = sum(g for g, _, h in rows if h in ("hot", "warm", "fresh"))
+    front, spent = 0, 0.0
+    for g, cpu, _ in sorted(rows, key=lambda r: -r[0] / max(r[1], 0.05)):
+        if g <= 0 or spent + cpu > 6.0:
+            continue
+        spent += cpu
+        front += g
+    x = (front, declined, ran)[mm]
+    payload = 0 if x < 1500 else 1 if x < 4500 else 2 if x < 7500 else 3
+    print(f"readout: reasons {reasons} front {front} ({spent:.1f} s cpu) declined {declined} ran {ran} m {mm} "
+          f"payload {payload}", file=sys.stderr)
+    return reasons << 4 | payload << 2 | mm
 
 
 def readout(answers, ms, tests):
