@@ -8,5 +8,6 @@ COPY selector.py map.json.gz /app/
 RUN python /app/selector.py --prepare /app/sq \
     && (python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/local/lib/python3.13 /app/st \
             /app/selector.py || echo "some files did not compile") \
+    && python -c "import py_compile; py_compile.compile('/app/selector.py', cfile='/app/selector.pyc', doraise=True)" \
     && chmod -R a+rX /app
-CMD ["python", "-I", "/app/selector.py"]
+CMD ["python", "-I", "/app/selector.pyc"]

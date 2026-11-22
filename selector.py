@@ -648,6 +648,26 @@ def patched(text, blocks):
     return "\n".join(out + lines[i - 1:])
 
 
+_CODE = {}  # (file name, text) -> its compiled module code, or the SyntaxError / ValueError it raised
+
+
+def compiled(text, fn):
+    """compile(text, fn, "exec", dont_inherit=True), once per text and file name in this process."""
+    k = (fn, text)
+    r = _CODE.get(k)
+    if r is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                r = compile(text, fn, "exec", dont_inherit=True)
+            except (SyntaxError, ValueError) as exc:
+                r = exc
+        _CODE[k] = r
+    if isinstance(r, BaseException):
+        raise r
+    return r
+
+
 def breaks_syntax(m, old, new, blocks):
     """True when the changed Python file no longer compiles. Python is the run's version (the image pins 3.13)."""
     if old is None:
@@ -657,14 +677,12 @@ def breaks_syntax(m, old, new, blocks):
         text = patched(src, blocks) if src is not None else None
         if text is None:
             return False
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            compile(text, new or old, "exec", dont_inherit=True)
-        except (SyntaxError, ValueError):
-            return True
-        except Exception:  # noqa: BLE001  (recursion and memory limits of a huge expression: not our concern)
-            return False
+    try:
+        compiled(text, os.path.join(ST, new or old))
+    except (SyntaxError, ValueError):
+        return True
+    except Exception:  # noqa: BLE001  (recursion and memory limits of a huge expression: not our concern)
+        return False
     return False
 
 
@@ -1150,11 +1168,13 @@ def tpcds_check():
 
 
 def query_check(job, tmp):
-    """The cheap stages of test_execute_tpcds on the tree at tmp (imported here), against the pinned outputs."""
+    """The cheap stages of test_execute_tpcds on the tree at tmp (imported here), against the pinned outputs. With
+    tmp None: on the sqlglot this process already has (the pinned tree with the commit's code put in)."""
     if True:
-        sys.path.insert(0, tmp)
+        if tmp is not None:
+            sys.path.insert(0, tmp)
         import sqlglot
-        if not os.path.abspath(sqlglot.__file__).startswith(tmp):
+        if not os.path.abspath(sqlglot.__file__).startswith(tmp if tmp is not None else os.path.join(ST, "")):
             print("wrong sqlglot", sqlglot.__file__)
             return 1
         # What the test's child imports (tests/test_executor.py), so the same modules are loaded.
@@ -2037,6 +2057,8 @@ def values_only(old_text, new_text):
         a, b = ast.parse(old_text), ast.parse(new_text)
     except (SyntaxError, ValueError):
         return False
+    if "\r" not in old_text and "\r" not in new_text:
+        return values_only_by_statement(a, b, old_text.split("\n"), new_text.split("\n"))
     if ast.dump(a) == ast.dump(b):
         return None
 
@@ -2059,6 +2081,60 @@ def values_only(old_text, new_text):
     blank(a.body)
     blank(b.body)
     return ast.dump(a) == ast.dump(b)
+
+
+def values_only_by_statement(a, b, la, lb):
+    """values_only on parsed trees, comparing only the statements whose source text differs (a statement with the
+    same text at the same columns parses to the same tree), recursing into class bodies. Same answers as dumping
+    both whole trees."""
+    def seg(lines, st):
+        # a decorated def / class starts at its first decorator, above its lineno
+        first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", ())])
+        return st.col_offset, st.end_col_offset, lines[first - 1:st.end_lineno]
+
+    def differing(x, y):
+        if len(x) != len(y):
+            return None
+        return [(s, t) for s, t in zip(x, y) if seg(la, s) != seg(lb, t)]
+    top = differing(a.body, b.body)
+    if top is None:
+        return False
+    if all(ast.dump(s) == ast.dump(t) for s, t in top):
+        return None
+
+    def blank1(st):
+        if isinstance(st, ast.Assign) and all(isinstance(x, ast.Name) for x in st.targets):
+            st.value = ast.Constant(None)
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            st.value = ast.Constant(None)
+        elif isinstance(st, ast.If):
+            for x in st.body + st.orelse:
+                blank1(x)
+        elif isinstance(st, (ast.Try, ast.With)):
+            for f in ("body", "orelse", "finalbody"):
+                for x in getattr(st, f, []):
+                    blank1(x)
+            for hd in getattr(st, "handlers", []):
+                for x in hd.body:
+                    blank1(x)
+        elif isinstance(st, ast.ClassDef):
+            for x in st.body:
+                blank1(x)
+
+    def same(s, t):
+        if isinstance(s, ast.ClassDef) and isinstance(t, ast.ClassDef):
+            bs, bt = s.body, t.body
+            s.body, t.body = [], []
+            head = ast.dump(s) == ast.dump(t)
+            s.body, t.body = bs, bt
+            if not head:
+                return False
+            inner = differing(bs, bt)
+            return inner is not None and all(same(x, y) for x, y in inner)
+        blank1(s)
+        blank1(t)
+        return ast.dump(s) == ast.dump(t)
+    return all(same(s, t) for s, t in top)
 
 
 def key_job(m, text):
@@ -2575,8 +2651,118 @@ def cls_check():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# A TPC-DS check whose commit only swaps function bodies runs in a fork of the runner parent, which has the pinned
+# tree imported already: the child puts the new code into the live functions as a hot test run does (modules not
+# loaded yet come from the patched text), then runs the same stages. Saves the new interpreter, the tree copy and
+# the import (~0.5 s CPU a check). Any doubt there: the check runs in its own process as before.
+_LIVE = {}  # set by runner_phase once its parent imported the tree: {"plans": {commit: hot plan}, "idx": functions}
+
+
+def live_check(job, plan, idx, timeout):
+    """(True / False, why) from a forked check on the live tree, or (None, why) when it cannot tell."""
+    import select
+    import signal
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        code = 3
+        try:
+            os.close(r)
+            try:
+                os.setpgid(0, 0)
+            except OSError:
+                pass
+            dn = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(w, 1)
+            if not RUN_DEBUG:
+                os.dup2(dn, 2)
+            sys.stdout = os.fdopen(1, "w", buffering=1)
+            for x, y in plan["pairs"]:
+                found = idx.get((x.co_filename, x.co_firstlineno, x.co_name), [])
+                live = [f for f in found if f.__code__ == x]
+                if len(live) != len(found):
+                    print("DOUBT a live function there has other code")
+                    os._exit(3)
+                for f in live:
+                    f.__code__ = y
+            py = {p: t for p, t in plan["files"].items() if p.endswith(".py")}
+            if py:
+                import importlib
+                sys.meta_path.insert(0, _PatchedFinder(py))
+                importlib.invalidate_caches()
+            if plan["files"]:
+                serve_patched_files(plan["files"])
+            sys.dont_write_bytecode = True
+            code = query_check(job, None)
+        except BaseException as exc:  # noqa: BLE001
+            try:
+                print("error", repr(exc)[:300])
+            except BaseException:  # noqa: BLE001
+                pass
+            code = 1
+        finally:
+            try:
+                sys.stdout.flush()
+            except BaseException:  # noqa: BLE001
+                pass
+            os._exit(code)
+    os.close(w)
+    buf, t_end, died = b"", time.monotonic() + timeout, False
+    try:
+        while True:
+            left = t_end - time.monotonic()
+            if left <= 0:
+                died = True
+                break
+            ready, _, _ = select.select([r], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        os.close(r)
+        if died:
+            for kill in (lambda: os.killpg(pid, signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
+                try:
+                    kill()
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+        _, st = os.waitpid(pid, 0)
+    lines = buf.decode("utf-8", "replace").strip().splitlines()
+    if died:
+        return False, "timed out"
+    rc = os.waitstatus_to_exitcode(st)
+    if rc == 3 or any(s.startswith("DOUBT") for s in lines):
+        return None, lines[-1:]
+    return rc == 0 and lines[-1:] == ["same"], lines[-1:]
+
+
 def run_checks(jobs, t0):
     """{commit: True when the check proved the test unaffected}. Two at a time; none starts after the budget."""
+    done = {}
+    for k in sorted(jobs, key=lambda k: jobs[k]["est"]):
+        job, plan = jobs[k], _LIVE.get("plans", {}).get(k)
+        if plan is None or job.get("kind") == "cls" or time.time() - t0 > CHECK_BUDGET_S:
+            continue
+        ok, why = live_check(job, plan, _LIVE["idx"], max(20.0, 4 * (job["est"] + job.get("xbudget", 0.0))))
+        if os.environ.get("BR_CHECK_AUDIT"):  # dev: the check in its own process agrees
+            k2, ok2 = own_checks(jobs, t0, [k])[0]
+            print(f"CHECK {'OK' if ok is None or ok == ok2 else 'MISMATCH'} {k} live {ok} own {ok2} {why}",
+                  file=sys.stderr, flush=True)
+        if ok is None:
+            continue
+        if not ok:
+            print(f"{k}: tpcds check keeps the test (live): {why}", file=sys.stderr)
+        done[k] = ok
+    rest = [k for k in jobs if k not in done]
+    done.update(dict(own_checks(jobs, t0, rest)))
+    return done
+
+
+def own_checks(jobs, t0, keys):
+    """[(commit, proved)] for these checks, each in its own process."""
     def one(k):
         if time.time() - t0 > CHECK_BUDGET_S:
             return k, False
@@ -2596,10 +2782,10 @@ def run_checks(jobs, t0):
                   file=sys.stderr)
         return k, ok
 
-    if not jobs:
-        return {}
+    if not keys:
+        return []
     with ThreadPoolExecutor(CHECK_JOBS) as ex:
-        return dict(ex.map(one, sorted(jobs, key=lambda k: jobs[k]["est"])))
+        return list(ex.map(one, sorted(keys, key=lambda k: jobs[k]["est"])))
 
 
 def fetch_tree(m, dest):
@@ -2682,6 +2868,16 @@ def prepare(dest):
     try:
         with gzip.open(MAP, "rb") as fh:
             d = json.loads(fh.read())
+        try:
+            if os.path.isdir(ST) and d.get("steps"):
+                knots = {}
+                for b in d["steps"]["tests"].values():
+                    info = json.loads(zlib.decompress(base64.b64decode(b)))["info"]
+                    knots.setdefault(f"{info['file']}:{info['line']}", method_knots(info["file"], info["line"]))
+                d["steps"]["knots"] = knots
+                print("test statement groups:", len(knots))
+        except Exception as exc:  # noqa: BLE001  (the runs then work them out themselves)
+            print("test statement groups not written:", repr(exc))
         with open(str(MAP) + ".pkl", "wb") as fh:
             pickle.dump(d, fh, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as exc:  # noqa: BLE001  (the map is then read from its JSON)
@@ -2848,17 +3044,33 @@ def same_behaviour(x, y):
     return True
 
 
+def line_consts(c):
+    """Indices of the constants a class body stores as __firstlineno__ (the class's line, set since Python 3.13):
+    a line added or removed above the class changes only that number."""
+    import dis
+    out, prev = set(), None
+    for ins in dis.get_instructions(c):
+        if ins.opname in ("STORE_NAME", "STORE_FAST") and ins.argval == "__firstlineno__" and prev is not None and                 prev.opname == "LOAD_CONST":
+            out.add(prev.arg)
+        prev = ins
+    return out
+
+
 def body_match(a, b, found):
     """True when a module or class body runs the same statements in both versions. The function code objects the
     two bodies make are collected in `found` as (pinned, patched) pairs and judged afterwards."""
     if any(getattr(a, f) != getattr(b, f) for f in _BODY_FIELDS) or len(a.co_consts) != len(b.co_consts):
         return False
-    for x, y in zip(a.co_consts, b.co_consts):
+    lines = None
+    for i, (x, y) in enumerate(zip(a.co_consts, b.co_consts)):
         if _is_code(x) != _is_code(y):
             return False
         if not _is_code(x):
             if not consts_match(x, y):
-                return False
+                if lines is None:
+                    lines = line_consts(a)
+                if not (i in lines and type(x) is int and type(y) is int):
+                    return False
             continue
         is_fn = x.co_flags & CO_OPTIMIZED
         if is_fn != y.co_flags & CO_OPTIMIZED:
@@ -2948,8 +3160,8 @@ def run_plan(m, text):
             try:
                 # both as from a .pyc: a set constant read back from one can iterate in another order (and its
                 # repr with it) than the one the compiler built
-                a = marshal.loads(marshal.dumps(compile(src, fn, "exec", dont_inherit=True)))
-                b = marshal.loads(marshal.dumps(compile(t, fn, "exec", dont_inherit=True)))
+                a = marshal.loads(marshal.dumps(compiled(src, fn)))
+                b = marshal.loads(marshal.dumps(compiled(t, fn)))
             except (SyntaxError, ValueError):
                 return None
         got = []
@@ -2960,6 +3172,8 @@ def run_plan(m, text):
             plan["pairs"] += ch
     if plan["mode"] == "fresh":
         plan["pairs"] = []
+    # every Python edit compiles to the same code (comments, blank lines): what changes is test data alone
+    plan["inert"] = plan["mode"] == "hot" and not plan["pairs"]
     return plan
 
 
@@ -3180,6 +3394,56 @@ def all_codes(c):
     return out
 
 
+# warm (a fresh plan whose Python edits are in sqlglot modules with a small importer group, see warm_group): the
+# child drops only that group (the changed modules and every module that imports one while loading) and all tests
+# modules, then imports the group again from the patched tree, as the warm key check does; the rest of sqlglot stays
+# as the parent loaded it. Same tree as a fresh child's at ~1/10 of the import CPU.
+def fresh_group(plan, graph):
+    """The sorted module group a warm child re-imports for this fresh plan, or None (the whole tree then)."""
+    if not graph:
+        return None
+    py = {p: t for p, t in plan["files"].items() if p.endswith(".py")}
+    if not py or any(not p.startswith("sqlglot/") or t is None for p, t in py.items()):
+        return None
+    g = warm_group(graph, py)
+    return sorted(g) if g else None
+
+
+def drop_group(group):
+    """In a warm child: forget the group's modules (and what a lazy package handed out of them) and every tests
+    module. Returns the group modules that were loaded, to import again once the patched finder is in place."""
+    import types
+    group = set(group)
+    loaded = sorted(m for m in group if m in sys.modules)
+    for m in sorted(group, key=len, reverse=True):
+        old = sys.modules.pop(m, None)
+        parent, _, leaf = m.rpartition(".")
+        if old is not None and parent in sys.modules and getattr(sys.modules[parent], leaf, None) is old:
+            delattr(sys.modules[parent], leaf)
+    for n, mo in list(sys.modules.items()):
+        if (n == "sqlglot" or n.startswith("sqlglot.")) and n not in group and "__getattr__" in vars(mo):
+            for a, v in list(vars(mo).items()):
+                if not isinstance(v, types.ModuleType) and getattr(v, "__module__", None) in group:
+                    delattr(mo, a)
+    for n in [k for k in sys.modules if k.partition(".")[0] == "tests"]:
+        del sys.modules[n]
+    return loaded
+
+
+def stale_dialects(group):
+    """True when the dialect registry still holds a class of a group module that is not that module's own now."""
+    d = sys.modules.get("sqlglot.dialects.dialect")
+    reg = getattr(getattr(d, "_Dialect", None), "_classes", None)
+    if not isinstance(reg, dict):
+        return True
+    group = set(group)
+    for v in list(reg.values()):
+        mod = getattr(v, "__module__", None)
+        if mod in group and getattr(sys.modules.get(mod), getattr(v, "__name__", ""), None) is not v:
+            return True
+    return False
+
+
 def child_run(plan, order, tests, wfd, idx, skip_after, red=None):
     """In the forked child: reproduce the patched tree, run `order` (test numbers, in run order), report lines
     "S n" (started), "V n code reached cpu_us" (code 0 pass, 1 fail, 2 not run or skipped), "X why" (doubt about
@@ -3198,7 +3462,10 @@ def child_run(plan, order, tests, wfd, idx, skip_after, red=None):
             os.dup2(dn, 2)
         files = plan["files"] if plan else {}
         codes = []
-        if plan and plan["mode"] == "fresh":
+        again = []
+        if plan and plan["mode"] == "fresh" and plan.get("group"):
+            again = drop_group(plan["group"])
+        elif plan and plan["mode"] == "fresh":
             for name in [k for k in sys.modules if k.partition(".")[0] in ("sqlglot", "tests")]:
                 del sys.modules[name]
         elif plan:
@@ -3218,6 +3485,17 @@ def child_run(plan, order, tests, wfd, idx, skip_after, red=None):
             importlib.invalidate_caches()
         if files:
             serve_patched_files(files)
+        failed = []
+        for name in again:  # what the parent had loaded of the group, now from the patched tree
+            try:
+                importlib.import_module(name)
+            except BaseException:  # noqa: BLE001
+                failed.append(name)
+        if plan and plan["mode"] == "fresh" and plan.get("group") and (failed or stale_dialects(plan["group"])):
+            # a group module that no longer imports, or a dialect registered by the parent's copy that the new
+            # import did not replace: the parent's objects would stay reachable. The whole tree then, as fresh.
+            for name in [k for k in sys.modules if k.partition(".")[0] in ("sqlglot", "tests")]:
+                del sys.modules[name]
         cur = [None, False]
         mon = sys.monitoring
         if codes:
@@ -3460,13 +3738,42 @@ def method_node(path, line):
 def stmt_closure(fn, keep):
     """The statements of fn to run so that the statements in keep run as in the whole method, or None when its
     statements cannot be left out."""
-    if isinstance(fn, ast.AsyncFunctionDef) or fn.decorator_list:
+    return close_over(stmt_knots(fn), keep)
+
+
+def close_over(knots, keep):
+    """stmt_closure from stmt_knots' answer."""
+    if knots is None or knots[1] is None:
         return None
+    n, comp, hard = knots
+    comps = {comp[i] for i in set(keep) | set(hard)}
+    return {i for i in range(n) if comp[i] in comps}
+
+
+_KNOTS = {}  # "file:line" -> stmt_knots of that test method, written into the map's pickle by --prepare
+
+
+def method_knots(path, line):
+    """(statements, group of each statement, statements that cannot be left out) of the test method at path:line,
+    with None groups when its statements cannot be left out; None when there is no such method."""
+    k = f"{path}:{line}"
+    if k not in _KNOTS:
+        node = method_node(path, line)
+        _KNOTS[k] = None if node is None else stmt_knots(node)
+    return _KNOTS[k]
+
+
+def stmt_knots(fn):
+    """(len(fn.body), [group of each statement], [statements that cannot be left out]), with None groups when the
+    statements of fn cannot be left out."""
+    n = len(fn.body)
+    if isinstance(fn, ast.AsyncFunctionDef) or fn.decorator_list:
+        return n, None, []
     nodes = list(ast.walk(fn))
     if any(isinstance(n, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom, ast.Await)) for n in nodes) or any(
             isinstance(n, ast.Attribute) and n.attr.startswith("__") and not n.attr.endswith("__") for n in nodes) or any(
             isinstance(n, ast.Name) and n.id in ("super", "__class__", "locals", "vars", "exec", "eval") for n in nodes):
-        return None
+        return len(fn.body), None, []
     a = fn.args
     local = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
     local |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
@@ -3517,8 +3824,7 @@ def stmt_closure(fn, keep):
                     hard.add(i)
                 elif isinstance(f, ast.Attribute) and f.attr in _STMT_MUTATING and root(f.value) not in local:
                     hard.add(i)
-    comps = {find(i) for i in set(keep) | hard}
-    return {i for i in range(len(fn.body)) if find(i) in comps}
+    return len(fn.body), [find(i) for i in range(len(fn.body))], sorted(hard)
 
 
 def trims(m, plan, cands, tests):
@@ -3529,6 +3835,8 @@ def trims(m, plan, cands, tests):
     if any(not p.startswith("sqlglot/") or not p.endswith(".py") for p in plan["files"]):
         return {}
     pm = m.d["steps"]
+    if not _KNOTS and pm.get("knots"):
+        _KNOTS.update(pm["knots"])
     ix = pm.get("_ix")
     if ix is None:
         ix = pm["_ix"] = {nm: i for i, nm in enumerate(pm["names"])}
@@ -3587,10 +3895,10 @@ def trim_spec(r, changed):
     if any(f not in files for f in entries):
         return None
     info = r["info"]
-    node = method_node(info["file"], info["line"])
-    if node is None or len(node.body) != info["n"]:
+    knots = method_knots(info["file"], info["line"])
+    if knots is None or knots[0] != info["n"]:
         return None
-    run = None if info.get("deco") else stmt_closure(node, stmts)
+    run = None if info.get("deco") else close_over(knots, stmts)
     if run is not None and len(run) == info["n"]:
         run = None
     if run is None and not filt:
@@ -3679,8 +3987,8 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
     """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate, classmates
     of test_execute_tpcds run here), or None when the runs cannot save more than they cost."""
     cpu, cls_cpu, bad = info.get("cpu", {}), info.get("cls", {}), set(info.get("bad", ()))
-    if not any(p.endswith(".py") for p in plan["files"]):
-        # Only test data changed: the candidates are the readers of the changed entries, which then compare against
+    if not any(p.endswith(".py") for p in plan["files"]) or plan.get("inert"):
+        # Only test data changed (the Python edits, if any, compile to the same code): the candidates are the readers of the changed entries, which then compare against
         # changed expectations or inputs. Such a run nearly always ends in the failure it was sure to find (8 of 8 on
         # the samples): it would change nothing in the answer and only cost CPU.
         return None
@@ -3792,18 +4100,30 @@ def tpcds_mates(m, tests, ms, tp):
     return mask
 
 
-def runner_phase(m, tests, ms, work, t_start, tp=None):
+def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     """work: [(commit, candidates, patch text)]. Returns ({commit: tests that passed here}, {commits whose
-    test_execute_tpcds classmates all passed here})."""
+    test_execute_tpcds classmates all passed here}). checks: commits with a TPC-DS check, which can then run on
+    this process's tree (_LIVE)."""
     import gc
     info = m.d.get("run") or {}
     if not os.path.isdir(os.path.join(ST, "sqlglot")) or not hasattr(os, "fork") or not info.get("cpu"):
         return {}, set()
     mates_all = tpcds_mates(m, tests, ms, tp)
-    jobs = []
+    graph = None
+    if not os.environ.get("BR_NO_WARM"):
+        try:
+            with open(SD + ".graph.json") as fh:
+                graph = json.load(fh)
+        except (OSError, ValueError):
+            graph = None
+    jobs, plans = [], {}
     for c, cands, text in work:
         try:
             plan = run_plan(m, text)
+            if plan and plan["mode"] == "fresh":
+                plan["group"] = fresh_group(plan, graph)
+            if plan and c in checks:
+                plans[c] = plan
             red = trims(m, plan, cands, tests) if plan else {}
             ch = run_choice(m, plan, cands, tests, ms, info, tp, mates_all, red) if plan else None
         except Exception as exc:  # noqa: BLE001
@@ -3821,9 +4141,9 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
     # The parent imports the test modules of every run once (sqlglot with them), watching whether a changed
     # function starts or a changed file is opened meanwhile: such a hot commit becomes fresh.
     watch = {}
-    for j in jobs:
-        for x, _ in j[2]["pairs"]:
-            watch.setdefault((x.co_filename, x.co_firstlineno, x.co_name), set()).add(j[0])
+    for c, plan in [(j[0], j[2]) for j in jobs] + list(plans.items()):
+        for x, _ in plan["pairs"]:
+            watch.setdefault((x.co_filename, x.co_firstlineno, x.co_name), set()).add(c)
     hit, opened = set(), set()
     mon = sys.monitoring
     mon.use_tool_id(mon.COVERAGE_ID, "br-watch")
@@ -3869,6 +4189,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     gc.freeze()
+    _LIVE.update(idx=idx, plans={c: p for c, p in plans.items() if p["mode"] == "hot" and c not in hit and not any(
+        os.path.join(ST, f) in opened for f in p["files"] if not f.endswith(".py"))})
     out, tp_ok = {}, set()
     jobs.sort(key=lambda j: j[3][4])
     for c, cands, plan, (run, skip_after, allowed, cap, spend, mates), red in jobs:
@@ -3881,6 +4203,28 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
             verdicts, status, doubt = fork_run(plan, run, tests, idx, skip_after, allowed, cap, left - 2.0, red)
             after = os.times()
             used = after.children_user + after.children_system - before.children_user - before.children_system
+            if os.environ.get("BR_HOT_AUDIT") and plan["mode"] == "hot":  # dev: a fresh run agrees
+                fplan = dict(plan, mode="fresh", pairs=[])
+                v3, st3, d3 = fork_run(fplan, run, tests, idx, set(), {n: 60.0 for n in run}, None, 120.0, None)
+                for n in run:
+                    if n in verdicts and n in v3 and 2 not in (verdicts[n][0], v3[n][0]):
+                        print(f"HOT {'MISMATCH' if verdicts[n][0] != v3[n][0] else 'OK'} {c} {tests[n]['id']} "
+                              f"hot {verdicts[n][0]} fresh {v3[n][0]}", file=sys.stderr, flush=True)
+            if os.environ.get("BR_WARM_AUDIT") and plan["mode"] == "fresh" and plan.get("group"):  # dev: a fresh run agrees
+                fplan = dict(plan, group=None)
+                b2 = os.times()
+                v4, st4, d4 = fork_run(fplan, run, tests, idx, skip_after, allowed, cap, 120.0, None)
+                a2 = os.times()
+                print(f"WARM CPU {c} warm {used:.3f} fresh "
+                      f"{a2.children_user + a2.children_system - b2.children_user - b2.children_system:.3f}",
+                      file=sys.stderr, flush=True)
+                for n in run:
+                    if n in verdicts and n in v4 and 2 not in (verdicts[n][0], v4[n][0]):
+                        print(f"WARM {'MISMATCH' if verdicts[n][0] != v4[n][0] else 'OK'} {c} {tests[n]['id']} "
+                              f"warm {verdicts[n][0]} fresh {v4[n][0]}", file=sys.stderr, flush=True)
+                    elif (n in verdicts) != (n in v4) or (n in verdicts and (verdicts[n][0] == 2) != (v4[n][0] == 2)):
+                        print(f"WARM DIFFRUN {c} {tests[n]['id']} warm {verdicts.get(n)} fresh {v4.get(n)}",
+                              file=sys.stderr, flush=True)
             if os.environ.get("BR_TRIM_AUDIT") and any(n in red for n in run):  # dev: the whole tests agree
                 v2, st2, d2 = fork_run(plan, run, tests, idx, set(), {n: 60.0 for n in run}, None, 120.0, None)
                 for n in run:
@@ -3909,7 +4253,7 @@ def runner_phase(m, tests, ms, work, t_start, tp=None):
                 and not any(mates_all >> n & 1 for n in failing) and any(n in passed for n in mates)
                 and not any(mates_all >> n & 1 and v[0] == 0 and n not in passed for n, v in verdicts.items())):
             tp_ok.add(c)
-        _log(f"{c} {plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} trimmed "
+        _log(f"{c} {'warm' if plan['mode'] == 'fresh' and plan.get('group') else plan['mode']} ran {len(verdicts)}/{len(run)} of {len(cands)} trimmed "
              f"{sum(1 for n in run if n in red)} pass {len(passed)} "
              f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}"
              + (f" mates {len(mates)} {'drop tpcds' if c in tp_ok else 'keep tpcds'}" if mates else ""))
@@ -4153,7 +4497,7 @@ def select_all(t_start):
     try:
         passed, tp_ok = runner_phase(m, {t["number"]: t for t in tests}, ms,
                                      [(stem, out[stem], text) for stem, _, text in rows if out[stem] and stem not in no_run],
-                                     t_start, tp)
+                                     t_start, tp, set(jobs))
     except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
         print(f"runner: {exc!r}", file=sys.stderr)
         passed, tp_ok = {}, set()
