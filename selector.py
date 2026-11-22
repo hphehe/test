@@ -3172,8 +3172,6 @@ def run_plan(m, text):
             plan["pairs"] += ch
     if plan["mode"] == "fresh":
         plan["pairs"] = []
-    # every Python edit compiles to the same code (comments, blank lines): what changes is test data alone
-    plan["inert"] = plan["mode"] == "hot" and not plan["pairs"]
     return plan
 
 
@@ -3987,8 +3985,8 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
     """(tests to run in run order, tests skipped after a failure, wall allowed per test, cap, CPU estimate, classmates
     of test_execute_tpcds run here), or None when the runs cannot save more than they cost."""
     cpu, cls_cpu, bad = info.get("cpu", {}), info.get("cls", {}), set(info.get("bad", ()))
-    if not any(p.endswith(".py") for p in plan["files"]) or plan.get("inert"):
-        # Only test data changed (the Python edits, if any, compile to the same code): the candidates are the readers of the changed entries, which then compare against
+    if not any(p.endswith(".py") for p in plan["files"]):
+        # Only test data changed: the candidates are the readers of the changed entries, which then compare against
         # changed expectations or inputs. Such a run nearly always ends in the failure it was sure to find (8 of 8 on
         # the samples): it would change nothing in the answer and only cost CPU.
         return None
