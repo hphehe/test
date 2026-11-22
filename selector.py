@@ -3127,7 +3127,7 @@ PIN = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 RUN_DEADLINE_S = float(os.environ.get("BR_RUN_WALL", 150))  # no child runs past this many seconds of the run
 HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, RUN_SHARE * (2 s + its recorded seconds))
 RUN_SHARE = 0.7
-RUN_LEVELS_S = [0.0, 0.5, 1.0, 2.0, 4.0]  # smaller run sets weighed against the budget's (classmates only at 0)
+RUN_LEVELS_S = []  # smaller run sets to weigh against the budget's (v23 tried 0, 0.5, 1, 2, 4 s: board CPU +3, sim −0.4)
 HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of test runs per commit
 FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
 FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
@@ -4241,7 +4241,8 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
     protect = {n for n in cands if tp_on and mates_all >> n & 1 and runnable(n) and cost(n) <= MATE_CHEAP_S}
     run = [n for n in cands if runnable(n) and (n in protect or
                                                 cost(n) <= max(HOLD_FLOOR_S, RUN_SHARE * (WORKER_MS / 1000 + ms[n] / 1000)))]
-    budget = HOT_BUDGET_S if plan["mode"] == "hot" else FRESH_BUDGET_S
+    # (a set plan keeps the fresh budget: it runs what a fresh plan would, without the import)
+    budget = HOT_BUDGET_S if plan["mode"] == "hot" and not plan.get("sets") else FRESH_BUDGET_S
     # The run sets weighed: the classmates plus the tests with the best recorded-to-CPU ratio up to each CPU level
     # (the last level is the budget, which takes them all when they fit).
     ranked = sorted((n for n in run if n not in protect), key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002))
