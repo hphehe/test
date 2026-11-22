@@ -4125,7 +4125,7 @@ AFTER_FAIL = 0.5  # once a test failed, a test runs only when it costs less than
 # seconds: they pass in about three of four such runs.
 RERUN = os.environ.get("BR_RERUN", "1") == "1"
 RERUN_PASS = 0.75
-RERUN_MIN_S = 2.0  # packed seconds those tests add to the answer, at least
+RERUN_MIN_S = float(os.environ.get("BR_RERUN_MIN", 0.5))  # packed seconds those tests add to the answer, at least
 LONG_S = 15.0  # never run here: test_execute_tpcds (it has its own proof) and test_max_nodes
 TEST_WALL_S = 4.0  # wall seconds a test may take: max(this, 25 x its cost)
 SETUP_WALL_S = 12.0  # wall seconds between tests (imports, class fixtures)
@@ -5592,13 +5592,14 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         if RERUN and status == "END" and failing:
             try:
                 rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, idx, t_start, tp, tp_ok,
-                              exp_mask)
+                              exp_mask, skip_after)
             except Exception as exc:  # noqa: BLE001
                 _log(c, "rerun:", repr(exc))
     return out, tp_ok
 
 
-def rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, idx, t_start, tp, tp_ok, exp_mask):
+def rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, idx, t_start, tp, tp_ok, exp_mask,
+                  skip_after=()):
     """A second child for the tests that the run of commit c left out after its first failure, when leaving out the
     ones that pass is expected to save more than the run costs. Adds to passed (and to _SEEN_FAIL) in place."""
     cpu = info.get("cpu", {})
@@ -5607,7 +5608,8 @@ def rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, i
         x = cpu.get(tests[n]["id"])
         x = x if x is not None else 1.5 * ms[n] / 1000 + 0.01
         return x * red[n]["frac"] if red and n in red else x
-    skipped = [n for n in run if n not in verdicts and n != tp]
+    # not reached, or skipped because an earlier test failed (those report "skipped", code 2)
+    skipped = [n for n in run if n != tp and (n not in verdicts or verdicts[n][0] == 2 and n in skip_after)]
     if not skipped:
         return
     answer = [n for n in cands if n not in passed and not (n == tp and c in tp_ok)]
