@@ -1221,8 +1221,23 @@ def changed_bodies(old_text, new_text):
             n.args = ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None,
                                    defaults=[])
             n.returns = None
+    if ast.dump(old_t) == ast.dump(new_t):
+        return spans
+    # Outside function bodies only the bodies of lambdas may differ (an entry of a table of lambdas): the new value
+    # is a function whose body runs only where it is called, as a function body does. The two trees pair their
+    # lambdas in walk order once the bodies are set aside.
+    lo = [n for n in ast.walk(old_t) if isinstance(n, ast.Lambda)]
+    ln = [n for n in ast.walk(new_t) if isinstance(n, ast.Lambda)]
+    if len(lo) != len(ln):
+        return None
+    bodies = [(a, b, ast.dump(a.body) != ast.dump(b.body)) for a, b in zip(lo, ln)]
+    for a, b, _ in bodies:
+        a.body = b.body = ast.Constant(None)
     if ast.dump(old_t) != ast.dump(new_t):
         return None
+    for a, b, diff in bodies:
+        if diff:
+            spans.append((a.lineno, a.end_lineno, "lambda"))
     return spans
 
 
@@ -1261,7 +1276,7 @@ def tpcds_job(m, patch_text, tp):
             if sp is None:
                 return None
             files[path] = new_text
-            spans += [(path, a, b) for a, b in sp]
+            spans += [(path, x[0], x[1], len(x) > 2) for x in sp]
             continue
         paths = {old, new} - {None, ""}
         for p in paths:
@@ -1275,7 +1290,7 @@ def tpcds_job(m, patch_text, tp):
         return None
     lines = tq["lines"]
     p_m = o_m = g_m = d_m = e_m = 0
-    for path, a, b in spans:
+    for path, a, b, lam in spans:
         fl = lines.get(path, {})
         for ln in range(a, b + 1):
             row = fl.get(str(ln))
@@ -1287,8 +1302,9 @@ def tpcds_job(m, patch_text, tp):
                     return None
                 continue
             p, o, g, d, x, e = row
-            if x:
+            if x and not lam:
                 return None  # runs at import or in table setup
+            # (a lambda's line also runs at import, where the function is made; its body runs where it is called)
             p_m |= p
             o_m |= o
             g_m |= g
@@ -3319,7 +3335,9 @@ def run_checks(jobs, t0):
         job, plan = jobs[k], _LIVE.get("plans", {}).get(k)
         if plan is None or job.get("kind") == "cls" or time.time() - t0 > CHECK_BUDGET_S:
             continue
+        c0 = sum(os.times()[:4])
         ok, why = live_check(job, plan, _LIVE["idx"], max(20.0, 4 * (job["est"] + job.get("xbudget", 0.0))))
+        _log(f"{k}: live check {ok} est {job['est']:.2f} cpu {sum(os.times()[:4]) - c0:.2f} mates_failed {k in _MATE_FAILED} {str(why)[:120]}")
         if os.environ.get("BR_CHECK_AUDIT"):  # dev: the check in its own process agrees
             k2, ok2 = own_checks(jobs, t0, [k])[0]
             print(f"CHECK {'OK' if ok is None or ok == ok2 else 'MISMATCH'} {k} live {ok} own {ok2} {why}",
@@ -4782,12 +4800,21 @@ def mates_phase(m, tests, ms, tp, out, no_run, tp_ok, texts, t_start):
         use_local_pool()
     cpu = (m.d.get("run") or {}).get("cpu", {})
     allowed = {n: max(TEST_WALL_S, 25 * cpu.get(tests[n]["id"], 1.5 * ms[n] / 1000)) for n in pool}
+    graph = None
+    if not os.environ.get("BR_NO_WARM"):
+        try:
+            with open(SD + ".graph.json") as fh:
+                graph = json.load(fh)
+        except (OSError, ValueError):
+            graph = None
     res = {}
     for c, plan in todo:
         left = t_start + MATE_WALL_S - time.monotonic()
         if left < 10.0:
             break
+        # (a warm child: only the changed modules' importer group comes again from the patched tree)
         fp = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
+        fp["group"] = fresh_group(fp, graph)
         v, status, doubt = fork_run(fp, pool, tests, _LIVE.get("idx", {}), set(pool), allowed, None, left)
         bad = [n for n, x in v.items() if x[0] == 1]
         if bad:
@@ -5230,21 +5257,10 @@ def select_all(t_start):
     _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
     for stem, ok in passed.items():
         out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
-    if not os.environ.get("BR_NO_MATES"):
-        try:
-            mres = mates_phase(m, {t["number"]: t for t in tests}, ms, tp, out, no_run, tp_ok,
-                               {stem: text for stem, _, text in rows}, t_start)
-        except Exception as exc:  # noqa: BLE001  (test_execute_tpcds stays)
-            print(f"classmates: {exc!r}", file=sys.stderr)
-            mres = {}
-        for stem, ok in mres.items():
-            if ok:
-                out[stem] = [n for n in out[stem] if n != tp]
-        _log(f"phase classmates: {sum(os.times()[:4]):.2f} s CPU, {sum(mres.values())} of {len(mres)} leave")
-    # The proof checks only where the runs left test_execute_tpcds in
-    # ... and where no classmate failed here: on 369 labelled commits, every one with a failing classmate also
-    # fails test_execute_tpcds (7 of 7), so a check there would only confirm it.
-    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run and k not in _MATE_FAILED}
+    # The proof checks first, wherever the runs left test_execute_tpcds in without seeing it fail, also where a
+    # classmate failed: on the board a commit fails a classmate while test_execute_tpcds passes.
+    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run
+            and tp not in _SEEN_FAIL.get(k, ())}
     try:
         dropped = run_checks(jobs, time.time())
     except Exception as exc:  # noqa: BLE001
@@ -5254,6 +5270,18 @@ def select_all(t_start):
     for stem, ok in dropped.items():
         if ok:
             out[stem] = [n for n in out[stem] if n != tp]
+    # The classmate runs only where no check ran.
+    if not os.environ.get("BR_NO_MATES"):
+        try:
+            mres = mates_phase(m, {t["number"]: t for t in tests}, ms, tp, out, no_run | set(jobs), tp_ok,
+                               {stem: text for stem, _, text in rows}, t_start)
+        except Exception as exc:  # noqa: BLE001  (test_execute_tpcds stays)
+            print(f"classmates: {exc!r}", file=sys.stderr)
+            mres = {}
+        for stem, ok in mres.items():
+            if ok:
+                out[stem] = [n for n in out[stem] if n != tp]
+        _log(f"phase classmates: {sum(os.times()[:4]):.2f} s CPU, {sum(mres.values())} of {len(mres)} leave")
     return [stem for stem, _, _ in rows], out
 
 
