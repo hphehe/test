@@ -1329,14 +1329,27 @@ def tpcds_job(m, patch_text, tp, max_est=None):
         return None
     q1 &= ~e_m  # a query that is executed is optimized there too (execute() runs the patched optimizer)
     qs = tq["q"]
+    ranges = [(path, a, b) for path, a, b, _ in spans]
+    rp = {}  # executed queries that step replay makes cheaper: its estimate
+    idx = xr_index() if e_m and ranges else None
+    if idx is not None:
+        dirty = xr_dirty(idx, ranges)
+        for i in range(len(qs)):
+            if e_m >> i & 1:
+                c = xr_cost(idx, i, dirty, qs[i]["cpu"])
+                if c is not None and c < qs[i]["xcpu"]:
+                    rp[i] = c
     est = 1.0 + 0.05 * len(px) + sum(qs[i]["cpu"] for i in range(len(qs)) if (q1 | d_m) >> i & 1) + \
-        sum(qs[i]["xcpu"] for i in range(len(qs)) if e_m >> i & 1)
+        sum(rp.get(i, qs[i]["xcpu"]) for i in range(len(qs)) if e_m >> i & 1)
     if est > max_est:
         return None
     pick = lambda mask, keys: [{"i": i, **{k: qs[i][k] for k in keys}} for i in range(len(qs)) if mask >> i & 1]  # noqa: E731
+    xq = pick(e_m, ("sql", "res", "xcpu"))
+    for q in xq:
+        if q["i"] in rp:
+            q["rp"], q["xcpu"] = 1, rp[q["i"]]
     return {"files": files, "schema": tq["schema"], "est": est, "q1": pick(q1, ("sql", "fo", "res", "xcpu")),
-            "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck")), "px": px,
-            "xq": pick(e_m, ("sql", "res", "xcpu")),
+            "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck")), "px": px, "xq": xq, "xr": ranges if rp else [],
             # CPU left for executing queries whose optimized tree turns out different (only known in the check)
             "xbudget": round(max_est - est, 3) if tables_ready() else 0.0}
 
@@ -1516,6 +1529,12 @@ def query_check(job, tmp):
         cache = {}
         shared_schema = None
 
+        def base_of(name):
+            if name not in cache:
+                with open(os.path.join(TP, name + ".pkl"), "rb") as fh:
+                    cache[name] = pickle.load(fh)
+            return cache[name]
+
         def same_result(q):
             # mp_execute in the test's child: the tables the query names, execute() with the shared schema, the
             # result pickled back to the parent, which compares it with duckdb's. Same result as at the pinned
@@ -1523,14 +1542,18 @@ def query_check(job, tmp):
             nonlocal shared_schema
             if shared_schema is None:
                 shared_schema = pickle.loads(pickle.dumps(job["schema"]))
+            if q.get("rp"):
+                try:
+                    v = xr_replay(q, job["xr"], shared_schema, base_of, job["schema"])
+                except TimeoutError:
+                    raise
+                except Exception as exc:  # noqa: BLE001  (the query then runs whole)
+                    _log(f"check: replay of {q['i']} failed {exc!r}"[:200])
+                    v = None
+                if v is not None:
+                    return v
             expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
-            tables = {}
-            for t in find_tables(expression):
-                name = t.name
-                if name not in cache:
-                    with open(os.path.join(TP, name + ".pkl"), "rb") as fh:
-                        cache[name] = pickle.load(fh)
-                tables[name] = cache[name]
+            tables = {t.name: base_of(t.name) for t in find_tables(expression)}
             table = pickle.loads(pickle.dumps(execute(expression, schema=shared_schema, tables=tables)))
             if result_hash(table) == q["res"]:
                 return True
@@ -1580,6 +1603,456 @@ def query_check(job, tmp):
                     return 1
         print("same")
         return 0
+
+
+# ---------------------------------------------------------------- step replay for the TPC-DS check
+# Build time (--prepare): every query test_execute_tpcds executes runs on the pinned tree as execute() runs it, with
+# its plan's steps in one fixed order, twice in a fresh child (cold, then warm). Kept per step: a key (its fields and
+# the keys of the steps it reads), the sqlglot functions it ran in either run, its CPU, a digest of its output and
+# the output itself. In the check, a query whose changed functions run only inside some of its steps builds its plan
+# with the patched planner, runs those steps (and any whose input then differs) with the patched executor on the kept
+# inputs, and takes every other step's output as kept. Anything unusual runs the whole query as before.
+
+XR = os.environ.get("BR_XR", "/app/xr")
+XR_BUILD_S = 210  # build-time limit: queries not recorded by then run whole in the check
+XR_TOOL = 4
+# the replay loop does these functions' work itself: a change in one runs the whole query
+XR_FRAME = {("sqlglot/executor/__init__.py", "execute"), ("sqlglot/executor/python.py", "PythonExecutor.execute"),
+            ("sqlglot/executor/python.py", "PythonExecutor._execute")}
+XR_SHARED = ("PythonExecutor._register_subquery", "PythonExecutor._subquery_table")  # executor state kept across steps
+_XR = {}
+
+
+def xr_val(v):
+    """A text for one field of a plan step that is the same in every process."""
+    from sqlglot.expressions import Expr
+    if isinstance(v, Expr):
+        return "E" + fingerprint(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ",".join(xr_val(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ",".join(f"{k!r}:{xr_val(x)}" for k, x in v.items()) + "}"
+    if isinstance(v, type):
+        return f"T{v.__module__}.{v.__qualname__}"
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return f"{type(v).__name__}:{v!r}"
+    raise ValueError(f"step field of type {type(v).__name__}")
+
+
+def xr_order(plan):
+    """[(key, step)] for every step of the plan, each after the steps it reads (ties by key); None when two steps have
+    one key."""
+    import heapq
+    every, stack = set(), [plan.root]
+    while stack:
+        s = stack.pop()
+        if s not in every:
+            every.add(s)
+            stack.extend(s.dependencies)
+    if any(not s.dependents <= every for s in every):
+        return None
+    keys = {}
+
+    def key(s):
+        if s not in keys:
+            own = "|".join(f"{k}={xr_val(v)}" for k, v in sorted(vars(s).items())
+                           if k not in ("dependencies", "dependents"))
+            deps = ",".join(sorted(key(d) for d in s.dependencies))
+            keys[s] = hashlib.sha1(f"{type(s).__module__}.{type(s).__qualname__}|{own}|{deps}".encode(
+                "utf-8", "surrogatepass")).hexdigest()
+        return keys[s]
+
+    for s in every:
+        key(s)
+    own = dict(keys)
+    up = {}
+
+    def upkey(s):  # also the steps that read it, up to the root: tells apart equal steps of other branches
+        if s not in up:
+            up[s] = hashlib.sha1((own[s] + "^" + ",".join(sorted(upkey(d) for d in s.dependents))).encode()).hexdigest()
+        return up[s]
+
+    for s in every:
+        upkey(s)
+    keys = up
+    if len(set(keys.values())) != len(keys):
+        return None
+    left = {s: len(s.dependencies) for s in every}
+    heap = [(keys[s], s) for s in every if not left[s]]  # keys are unique: two steps are never compared
+    heapq.heapify(heap)
+    out = []
+    while heap:
+        k, s = heapq.heappop(heap)
+        out.append((k, s))
+        for d in s.dependents:
+            left[d] -= 1
+            if not left[d]:
+                heapq.heappush(heap, (keys[d], d))
+    return out if len(out) == len(every) else None
+
+
+def xr_digest(tables):
+    """What a later step can read from a step's output: per table its class, columns, column range and rows."""
+    rows = [(name, type(t).__qualname__, tuple(t.columns), repr(t.column_range), [tuple(r) for r in t.rows])
+            for name, t in tables.items()]
+    return hashlib.sha1(repr(rows).encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def xr_dumps(obj):
+    """Pickle that keeps sqlglot trees whole (every slot as it is: the trees' own pickling keeps less)."""
+    import copyreg
+    import io
+    from sqlglot.expressions import Expression
+    table = {}
+
+    def keep(x):
+        cls = type(x)
+        slots = {}
+        for n in [n for c in cls.__mro__ for n in c.__dict__.get("__slots__", ())]:
+            try:
+                slots[n] = object.__getattribute__(x, n)
+            except AttributeError:
+                pass
+        return copyreg.__newobj__, (cls,), (getattr(x, "__dict__", None) or None, slots)
+
+    stack = [Expression]
+    while stack:
+        c = stack.pop()
+        table[c] = keep
+        stack.extend(c.__subclasses__())
+    buf = io.BytesIO()
+    p = pickle.Pickler(buf, protocol=pickle.HIGHEST_PROTOCOL)
+    p.dispatch_table = {**copyreg.dispatch_table, **table}
+    p.dump(obj)
+    return buf.getvalue()
+
+
+def xr_begin(schema, tables):
+    """execute()'s work before optimize(): the schema and the tables it reads."""
+    from sqlglot.errors import ExecuteError
+    from sqlglot.executor.table import ensure_tables
+    from sqlglot.schema import ensure_schema
+    tables_ = ensure_tables(tables, dialect=None)
+    schema = ensure_schema(schema, dialect=None)
+    if tables_.supported_table_args and tables_.supported_table_args != schema.supported_table_args:
+        raise ExecuteError("Tables must support the same table args as schema")
+    return schema, tables_
+
+
+def xr_plan(optimized, tables_):
+    """execute()'s work after optimize(), up to the steps: the plan and the executor."""
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.planner import Plan
+    optimized.sql(pretty=True)  # execute() makes this text for its log line
+    plan = Plan(optimized)
+    ex = PythonExecutor(tables=tables_)
+    ex._ctes, ex._outer_scope = plan.ctes, None  # what PythonExecutor.execute sets around the steps
+    return plan, ex
+
+
+def xr_step(ex, step, inputs):
+    """One step as PythonExecutor._execute runs it, on the outputs (tables) of the steps it reads."""
+    from sqlglot import planner
+    context = ex.context({name: table for dep in step.dependencies for name, table in inputs[dep].items()})
+    if isinstance(step, planner.Scan):
+        out = ex.scan(step, context)
+    elif isinstance(step, planner.Aggregate):
+        out = ex.aggregate(step, context)
+    elif isinstance(step, planner.Join):
+        out = ex.join(step, context)
+    elif isinstance(step, planner.Sort):
+        out = ex.sort(step, context)
+    elif isinstance(step, planner.SetOperation):
+        out = ex.set_operation(step, context)
+    else:
+        raise NotImplementedError
+    if step.offset:
+        table = out.tables[step.name]
+        table.rows = table.rows[step.offset:]
+    return out.tables
+
+
+def xr_record(i):
+    """Child at build time: query i twice (cold, warm) with a function monitor; writes its outputs, returns its row."""
+    sql, schema_blob, base, root_dir, out_dir = _XR["build"][i]
+    from sqlglot import find_tables, parse_one
+    from sqlglot.optimizer import optimize
+    mon = sys.monitoring
+    cur = [None]
+    names = {}
+
+    def hit(code, offset):
+        if cur[0] is not None:
+            cur[0].add(code)
+        return mon.DISABLE
+
+    def seg(s):
+        cur[0] = s
+        mon.restart_events()
+
+    mon.use_tool_id(XR_TOOL, "xr")
+    mon.register_callback(XR_TOOL, mon.events.PY_START, hit)
+    mon.register_callback(XR_TOOL, mon.events.PY_RESUME, hit)
+    mon.set_events(XR_TOOL, mon.events.PY_START | mon.events.PY_RESUME)
+    prefix = os.path.join(root_dir, "")
+
+    def ids(codes):
+        out = set()
+        for c in codes:
+            if c not in names:
+                f = c.co_filename
+                if f.startswith(prefix) and f[len(prefix):].startswith("sqlglot/"):
+                    last = max([ln for _, _, ln in c.co_lines() if ln is not None] or [c.co_firstlineno])
+                    names[c] = (f[len(prefix):].replace(os.sep, "/"), c.co_qualname, c.co_firstlineno, last)
+                else:
+                    names[c] = None
+            if names[c] is not None:
+                out.add(names[c])
+        return out
+
+    shared = pickle.loads(schema_blob)
+    runs = []
+    for attempt in range(2):
+        opt_s, rest_s = set(), set()
+        seg(opt_s)
+        expression = pickle.loads(pickle.dumps(parse_one(sql)))
+        tables = {t.name: base[t.name] for t in find_tables(expression)}
+        seg(rest_s)
+        schema, tables_ = xr_begin(shared, tables)
+        seg(opt_s)
+        optimized = optimize(expression, schema, leave_tables_isolated=True, dialect=None)
+        seg(rest_s)
+        opt_blob = xr_dumps(optimized)
+        if fingerprint(pickle.loads(opt_blob)) != fingerprint(optimized):
+            return {"why": "tree copy"}
+        plan, ex = xr_plan(optimized, tables_)
+        seg(None)
+        order = xr_order(plan)
+        if order is None:
+            return {"why": "order"}
+        pos = {s: j for j, (_, s) in enumerate(order)}
+        outs, sets, digs, cpu, blobs, mut = {}, [], [], [], {}, set()
+        for j, (_, s) in enumerate(order):
+            st = set()
+            seg(st)
+            c0 = time.thread_time()
+            outs[s] = xr_step(ex, s, outs)
+            cpu.append(time.thread_time() - c0)
+            seg(None)
+            sets.append(st)
+            digs.append(xr_digest(outs[s]))
+            for d in s.dependencies:
+                if len(d.dependents) > 1 and xr_digest(outs[d]) != digs[pos[d]]:
+                    mut.add(pos[d])  # a step that several steps read, changed in place by one of them
+            if attempt == 0:
+                blobs[j] = zlib.compress(pickle.dumps(outs[s], protocol=pickle.HIGHEST_PROTOCOL), 6)
+        root = plan.root
+        res = result_hash(pickle.loads(pickle.dumps(outs[root][root.name])))
+        runs.append({"keys": [k for k, _ in order], "deps": [sorted(pos[d] for d in s.dependencies) for _, s in order],
+                     "sets": sets, "opt": opt_s, "rest": rest_s, "digs": digs, "cpu": cpu, "res": res,
+                     "root": pos[root], "fo": fingerprint(optimized), "tabs": sorted(tables), "mut": sorted(mut),
+                     "ctes": None if plan.ctes is None else fingerprint(plan.ctes),
+                     "multi": sorted(pos[s] for _, s in order if len(s.dependents) > 1)})
+        if attempt == 0:
+            with open(os.path.join(out_dir, f"{i}.pkl"), "wb") as fh:
+                pickle.dump({"opt": opt_blob, "out": blobs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    mon.set_events(XR_TOOL, 0)
+    a, b = runs
+    if a["keys"] != b["keys"] or a["digs"] != b["digs"] or a["res"] != b["res"] or a["fo"] != b["fo"] or             a["mut"] != b["mut"] or a["ctes"] != b["ctes"]:
+        return {"why": "unstable"}
+    cold = set().union(a["opt"], a["rest"], *a["sets"])
+    warm = set().union(b["opt"], b["rest"], *b["sets"])
+    sets = [ids(x | y) for x, y in zip(a["sets"], b["sets"])]
+    shared_steps = [j for j, s in enumerate(sets) if any(n[0] == "sqlglot/executor/python.py" and n[1] in XR_SHARED
+                                                         for n in s)]
+    if shared_steps:  # steps that share subquery plans and results: one changes, they all run
+        u = set().union(*(sets[j] for j in shared_steps))
+        for j in shared_steps:
+            sets[j] = u
+    return {"keys": a["keys"], "deps": a["deps"], "fn": sets, "opt": ids(a["opt"] | b["opt"]),
+            "rest": ids(a["rest"] | b["rest"]), "first": ids(cold - warm), "dig": a["digs"],
+            "cost": [round(min(x, y), 5) for x, y in zip(a["cpu"], b["cpu"])], "res": a["res"], "root": a["root"],
+            "fo": a["fo"], "tabs": a["tabs"], "mut": set(a["mut"]), "multi": set(a["multi"]), "ctes": a["ctes"]}
+
+
+def xr_build(root_dir, out_dir, map_path=None):
+    """Build time: record every executed TPC-DS query of the map (forked children, a few at a time)."""
+    import multiprocessing
+    t_end = time.monotonic() + XR_BUILD_S
+    m = Map(map_path or MAP)
+    tq = m.d.get("tpq")
+    if not tq or not tables_ready():
+        print("step replay: no TPC-DS record or tables")
+        return
+    sys.path.insert(0, root_dir)
+    import sqlglot
+    if not os.path.abspath(sqlglot.__file__).startswith(os.path.abspath(root_dir)):
+        raise RuntimeError("wrong sqlglot")
+    from sqlglot import exp, find_tables, parse_one, transpile  # noqa: F401  (what the check imports)
+    from sqlglot.executor import execute  # noqa: F401
+    from sqlglot.executor.python import Python, PythonExecutor  # noqa: F401
+    from sqlglot.executor.table import Table, ensure_tables  # noqa: F401
+    from sqlglot.optimizer import optimize  # noqa: F401
+    from sqlglot.planner import Plan  # noqa: F401
+    base = {}
+    for f in os.listdir(TP):
+        if f.endswith(".pkl"):
+            with open(os.path.join(TP, f), "rb") as fh:
+                base[f[:-4]] = pickle.load(fh)
+    os.makedirs(out_dir, exist_ok=True)
+    schema_blob = pickle.dumps(tq["schema"])
+    todo = [i for i, q in enumerate(tq["q"]) if q.get("x") and q.get("res")]
+    _XR["build"] = {i: (tq["q"][i]["sql"], schema_blob, base, root_dir, out_dir) for i in todo}  # the children inherit it
+    ctx = multiprocessing.get_context("fork")
+    rows, fns = {}, {}
+    with ctx.Pool(max(1, min(4, os.cpu_count() or 1)), maxtasksperchild=1) as pool:
+        pend = {i: pool.apply_async(xr_record, (i,)) for i in todo}
+        for i, r in pend.items():
+            try:
+                row = r.get(max(1.0, t_end - time.monotonic()))
+            except Exception as exc:  # noqa: BLE001  (not recorded: the query runs whole in the check)
+                print(f"step replay: query {i}: {exc!r}"[:300])
+                continue
+            if "why" in row:
+                print(f"step replay: query {i}: {row['why']}")
+                continue
+            if row["res"] != tq["q"][i]["res"]:
+                print(f"step replay: query {i}: another result than the map's")
+                continue
+            num = lambda names: frozenset(fns.setdefault(n, len(fns)) for n in names)  # noqa: E731
+            row["fn"] = [num(s) for s in row["fn"]]
+            for k in ("opt", "rest", "first"):
+                row[k] = num(row[k])
+            p = os.path.join(out_dir, f"{i}.pkl")
+            with open(p, "rb") as fh:
+                blobs = pickle.load(fh)["out"]
+            row["size"] = [len(blobs.get(j, b"")) for j in range(len(row["keys"]))]
+            rows[i] = row
+        pool.terminate()
+    table = [None] * len(fns)
+    for n, k in fns.items():
+        table[k] = n
+    with open(os.path.join(out_dir, "index.pkl"), "wb") as fh:
+        pickle.dump({"fn": table, "q": rows}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"step replay: {len(rows)} of {len(todo)} queries recorded, {len(fns)} functions, "
+          f"{sum(os.path.getsize(os.path.join(out_dir, f)) for f in os.listdir(out_dir)) / 1e6:.1f} MB")
+
+
+def xr_index():
+    if "idx" not in _XR:
+        try:
+            with open(os.path.join(XR, "index.pkl"), "rb") as fh:
+                _XR["idx"] = pickle.load(fh)
+        except Exception:  # noqa: BLE001  (no record: every query runs whole)
+            _XR["idx"] = None
+    return _XR["idx"]
+
+
+def xr_dirty(idx, ranges):
+    """The recorded functions that one of the changed line ranges [(path, first, last)] falls in, or None when one is a
+    function the replay loop stands for."""
+    out = set()
+    for k, (path, qual, a, b) in enumerate(idx["fn"]):
+        if any(path == p and a <= hi and lo <= b for p, lo, hi in ranges):
+            if (path, qual) in XR_FRAME:
+                return None
+            out.add(k)
+    return out
+
+
+def xr_cost(idx, i, dirty, opt_cpu):
+    """Estimated CPU of replaying query i, or None when it must run whole."""
+    r = idx["q"].get(i)
+    if r is None or dirty is None or not dirty or dirty & r["first"]:
+        return None
+    if any(idx["fn"][k][0] != "sqlglot/planner.py" for k in dirty & r["rest"]):
+        return None  # outside the steps only the planner may change (the plan is built again and compared)
+    if not dirty & set().union(r["opt"], r["rest"], *r["fn"]):
+        return None  # the map says the changed code runs here, the record does not: run it whole
+    cost = 0.03 + (opt_cpu if dirty & r["opt"] else 0.0) + 2e-8 * r["size"][r["root"]]
+    for j, fn in enumerate(r["fn"]):
+        if fn & dirty:
+            cost += 1.3 * r["cost"][j] + sum(2e-8 * r["size"][d] for d in r["deps"][j])
+    return cost
+
+
+def xr_replay(q, ranges, shared_schema, base_of, duck_schema):
+    """Query q (an executed one) by step replay on the patched code loaded here: True when its result is the pinned
+    one, False when it differs, None when it must run whole."""
+    from sqlglot import parse_one
+    from sqlglot.optimizer import optimize
+    idx = xr_index()
+    if idx is None:
+        return None
+    dirty = xr_dirty(idx, ranges)
+    if xr_cost(idx, q["i"], dirty, 0.0) is None:
+        return None
+    r = idx["q"][q["i"]]
+    with open(os.path.join(XR, f"{q['i']}.pkl"), "rb") as fh:
+        kept = pickle.load(fh)
+    tables = {name: base_of(name) for name in r["tabs"]}
+    schema, tables_ = xr_begin(shared_schema, tables)
+    if dirty & r["opt"]:
+        expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
+        optimized = optimize(expression, schema, leave_tables_isolated=True, dialect=None)
+        if fingerprint(optimized) != r["fo"]:
+            return None
+    else:
+        optimized = pickle.loads(kept["opt"])
+    plan, ex = xr_plan(optimized, tables_)
+    order = xr_order(plan)
+    if order is None or [k for k, _ in order] != r["keys"]:
+        return None
+    if (None if plan.ctes is None else fingerprint(plan.ctes)) != r["ctes"]:
+        return None  # what subqueries inside the steps are planned with
+    pos = {s: j for j, (_, s) in enumerate(order)}
+    runs = [bool(fn & dirty) for fn in r["fn"]]  # steps that run changed code
+    readers = [[] for _ in order]
+    for j, deps in enumerate(r["deps"]):
+        for d in deps:
+            readers[d].append(j)
+    # an output that several steps read, not all of which run: whoever runs must leave it as it was
+    mixed = [len(x) > 1 and not all(runs[c] for c in x) for x in readers]
+    same, outs = [], []
+
+    def is_same(d):  # a step that ran: its output compared with the kept one only when a later step asks
+        if same[d] is None:
+            same[d] = xr_digest(outs[d]) == r["dig"][d]
+        return same[d]
+
+    for j, (_, s) in enumerate(order):
+        if not runs[j] and all(is_same(d) for d in r["deps"][j]):
+            same.append(True)
+            outs.append(None)
+            continue
+        inputs = {}
+        for d in s.dependencies:
+            k = pos[d]
+            if k in r["mut"] and mixed[k]:
+                return None  # changed in place by one of the steps that read it, and not all of them run
+            if outs[k] is None:
+                outs[k] = pickle.loads(zlib.decompress(kept["out"][k]))
+            inputs[d] = outs[k]
+        try:
+            out = xr_step(ex, s, inputs)
+        except TimeoutError:
+            raise
+        except Exception:  # noqa: BLE001  (on the pinned inputs: the whole query fails the same way)
+            return False
+        for d in s.dependencies:
+            k = pos[d]
+            if mixed[k] and xr_digest(outs[k]) != r["dig"][k]:
+                return None  # changed an output that steps which do not run read
+        same.append(None)
+        outs.append(out)
+    k = r["root"]
+    if outs[k] is None:
+        outs[k] = pickle.loads(zlib.decompress(kept["out"][k]))
+    root = order[k][1]
+    table = pickle.loads(pickle.dumps(outs[k][root.name]))
+    if result_hash(table) == q["res"]:
+        return True
+    return test_comparison(q["sql"], table, duck_schema)
 
 
 # ---------------------------------------------------------------- class-level TPC-DS check
@@ -3553,6 +4026,13 @@ def prepare(dest):
     except Exception as exc:  # noqa: BLE001  (no tables: checks that must execute a query keep the test)
         print("TPC-DS tables not built:", repr(exc))
     try:
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), "--replay-build", dest], timeout=XR_BUILD_S + 90)
+        if p.returncode != 0:
+            raise RuntimeError(f"exit {p.returncode}")
+    except Exception as exc:  # noqa: BLE001  (no record: every executed query runs whole in the check)
+        print("step replay not built:", repr(exc))
+        shutil.rmtree(XR, ignore_errors=True)
+    try:
         build_state_base(dest, SD)
     except Exception as exc:  # noqa: BLE001  (no state base: the class-level check never runs)
         print("state base not built:", repr(exc))
@@ -5461,6 +5941,8 @@ def select_all(t_start):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--prepare"]:
         prepare(sys.argv[2])
+    elif sys.argv[1:2] == ["--replay-build"]:
+        xr_build(sys.argv[2], XR)
     elif sys.argv[1:2] == ["--tpcds-check"]:
         sys.exit(tpcds_check())
     elif sys.argv[1:2] == ["--cls-check"]:
