@@ -443,6 +443,10 @@ def select_sqlglot(m, path, blocks):
         # Only comments or blank lines, none inside a multi-line string: nothing runs differently.
         if all(is_comment_or_blank(t) for t in texts) and not in_string:
             continue
+        got = dropped_decorator(m, path, removed, added)
+        if got is not None:
+            sel |= got
+            continue
         got = swap_tests(m, path, removed, added)
         if got is not None:
             sel |= got  # 0 when every swap agreed in every test
@@ -490,6 +494,88 @@ def select_sqlglot(m, path, blocks):
                 b = m.blocks(path).innermost(at)
             sel |= importers if b is None else m.set(b[3])
     return sel
+
+
+_DESCRIPTORS = ("property", "classmethod", "staticmethod")
+
+
+def plain_wrapper(m, tree, name):
+    """True when `name` is a decorator written at the top of this module (`tree`) as
+        def name(func):  ["doc"]  [@wraps(func)] def inner(...): <first statement calls func> ...  return inner
+    : applying it does nothing else, and every call of what it made runs the function it was given."""
+    d = next((s for s in tree.body if isinstance(s, ast.FunctionDef) and s.name == name), None)
+    if d is None or d.decorator_list or len(d.args.args) != 1 or d.args.vararg or d.args.kwarg or \
+            d.args.kwonlyargs or d.args.posonlyargs or d.args.defaults:
+        return False
+    func = d.args.args[0].arg
+    body = d.body[1:] if d.body and isinstance(d.body[0], ast.Expr) and isinstance(
+        getattr(d.body[0], "value", None), ast.Constant) else d.body
+    if len(body) != 2 or not isinstance(body[0], ast.FunctionDef) or not isinstance(body[1], ast.Return) or \
+            not isinstance(body[1].value, ast.Name) or body[1].value.id != body[0].name:
+        return False
+    inner = body[0]
+    for dec in inner.decorator_list:
+        f = dec.func if isinstance(dec, ast.Call) else None
+        if not (f is not None and ((isinstance(f, ast.Name) and f.id == "wraps") or (
+                isinstance(f, ast.Attribute) and f.attr == "wraps" and isinstance(f.value, ast.Name)
+                and f.value.id == "functools"))):
+            return False
+    if not inner.body:
+        return False
+    first = inner.body[0]
+    if not isinstance(first, (ast.Assign, ast.AnnAssign, ast.Return, ast.Expr)):
+        return False
+    v = first.value  # the call itself, not one inside a condition
+    return isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == func and all(
+        isinstance(a, (ast.Name, ast.Starred)) for a in v.args) and all(
+        isinstance(k.value, ast.Name) for k in v.keywords)
+
+
+def dropped_decorator(m, path, removed, added):
+    """For a block that only deletes `@property` / `@classmethod` / `@staticmethod` lines of methods defined in a
+    class body: the tests that ran those methods' bodies (any use of such a method runs its body, before and after the
+    change), or None. Not for a method whose name decorates another (`@x.setter`), a dunder, or a body that ran
+    while the module loaded."""
+    if added or not removed or any(not re.fullmatch(r"@\w+", t.strip()) for _, t in removed):
+        return None
+    src = m.source(path)
+    if src is None:
+        return None
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return None
+    passes = {d for d in _DESCRIPTORS}
+    for _, t in removed:
+        if t.strip()[1:] not in passes and not plain_wrapper(m, tree, t.strip()[1:]):
+            return None
+        passes.add(t.strip()[1:])
+    lines = {x for x, _ in removed}
+    rt, imp = m.spans(path, "rt"), m.spans(path, "imp")
+    sel, found = 0, set()
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        fns = [s for s in cls.body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        named = {d.value.id for f in fns for d in f.decorator_list
+                 if isinstance(d, ast.Attribute) and isinstance(d.value, ast.Name)}
+        for fn in fns:
+            for d in fn.decorator_list:
+                if d.lineno not in lines:
+                    continue
+                if not (isinstance(d, ast.Name) and d.id in passes) or fn.name in named or \
+                        (fn.name.startswith("__") and fn.name.endswith("__")):
+                    return None
+                found.add(d.lineno)
+                lo = fn.body[0].lineno
+                for x in range(lo, fn.end_lineno + 1):
+                    i = imp.find(x)
+                    if i is not None and i[0] >= lo:
+                        return None
+                    r = rt.find(x)
+                    if r is not None:
+                        sel |= m.set(r[2])
+    return sel if found == lines else None
 
 
 def outer_lambdas(tree):
@@ -744,6 +830,62 @@ def annotations_only(m, path, blocks):
     return ast.dump(a) == ast.dump(b)
 
 
+def _checking(test):
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or \
+        (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING" and isinstance(test.value, ast.Name))
+
+
+_CHECK_IF = re.compile(r"^[ \t]*if[ \t]+(?:\w+\.)?TYPE_CHECKING[ \t]*:[ \t]*(?:#.*)?$", re.M)
+
+
+def checking_only(m, path, blocks):
+    """True when an in-place edit of a sqlglot module changes only the bodies of `if TYPE_CHECKING:` blocks (typing's
+    flag, False at run time: those bodies never run; an `else:` branch does and stays compared)."""
+    # cheap first: such a body never runs, so none of its lines is in a run span
+    rt = m.spans(path, "rt")
+    for removed, added, at in blocks:
+        for x in [x for x, _ in removed] or [at - 1]:
+            if rt.find(x) is not None:
+                return False
+    src = m.source(path)
+    if src is None or "TYPE_CHECKING" not in src:
+        return False
+    # then every changed line inside such a block by indentation (the trees below decide)
+    lines = src.split("\n")
+    spans = []
+    for mt in _CHECK_IF.finditer(src):
+        h = src.count("\n", 0, mt.start()) + 1
+        c, end = indent(lines[h - 1]), h
+        for j in range(h, len(lines)):
+            u = lines[j]
+            if u.strip() and indent(u) <= c:
+                break
+            end = j + 1
+        spans.append((h, end, c))
+    for removed, added, at in blocks:
+        if not any(all(h < x <= e for x, _ in removed) and h < at <= e + 1 and
+                   all(not t.strip() or indent(t) > c for t in added) for h, e, c in spans):
+            return False
+    new = patched(src, blocks)
+    if new is None:
+        return False
+    try:
+        a, b = ast.parse(src), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return False
+    if ast.dump(a) == ast.dump(b):
+        return False
+
+    def blank(tree):
+        n = 0
+        for st in ast.walk(tree):
+            if isinstance(st, ast.If) and _checking(st.test):
+                st.body = [ast.Pass()]
+                n += 1
+        return n
+    return bool(blank(a)) and bool(blank(b)) and ast.dump(a) == ast.dump(b)
+
+
 def select(m, patch_text):
     sel = 0
     # In-place edits of the TPC-H / TPC-DS query files: only the TestExecutor tests whose inputs changed (see
@@ -803,7 +945,7 @@ def select(m, patch_text):
             if new is None or (new and new != old):
                 sel |= m.set(m.d["files"][path]["importers"])
                 continue
-            if annotations_only(m, path, blocks):
+            if annotations_only(m, path, blocks) or checking_only(m, path, blocks):
                 continue  # (the tests that read the file as text are in already)
             lam = lambda_price(m, path, blocks)
             sel |= lam if lam is not None else select_sqlglot(m, path, blocks)
@@ -1905,6 +2047,8 @@ def key_snap_main(argv):
         r = {"why": f"snapshot failed: {exc!r}"}
     else:
         r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats})
+        if "why" not in r:
+            r["shadow"] = shadows(r)
         if "why" not in r and SET_PLANS:
             r["values"] = diff_values(r)
     with open(out, "w") as fh:
@@ -2078,9 +2222,18 @@ def key_server_main(argv):
                         importlib.import_module(m)
                     except BaseException as exc:  # noqa: BLE001
                         new_errs[m] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                # a re-made package does not get back its submodules that stayed loaded (the import system sets that
+                # attribute only when it loads the submodule): set them, as a fresh import of the tree has them
+                for n, mo in list(sys.modules.items()):
+                    parent, _, leaf = n.rpartition(".")
+                    pm = sys.modules.get(parent) if parent in group and n not in group else None
+                    if pm is not None and mo is not None and leaf not in vars(pm):
+                        setattr(pm, leaf, mo)
                 keys, bags, stats = snap_state(root, base["unstable"], want, roots=group, errs=new_errs)
                 scope = {k for m in group for k in by_root.get(m, ())} | {DIALECT_TABLE}
                 r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats}, scope)
+                if "why" not in r:
+                    r["shadow"] = shadows(r)
                 if "why" not in r and SET_PLANS:
                     r["values"] = diff_values(r)
                 with open(job["out"], "w") as fh:
@@ -2162,14 +2315,49 @@ def values_only_by_statement(a, b, la, lb):
         first = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", ())])
         return st.col_offset, st.end_col_offset, lines[first - 1:st.end_lineno]
 
+    def kind(st):
+        return type(st), getattr(st, "name", None)
+
     def differing(x, y):
         if len(x) != len(y):
             return None
-        return [(s, t) for s, t in zip(x, y) if seg(la, s) != seg(lb, t)]
+        d = [(s, t) for s, t in zip(x, y) if seg(la, s) != seg(lb, t)]
+        return d if all(kind(s) == kind(t) for s, t in d) else None
+
+    def constant(st):  # NAME = ... (not a dunder or _sunder_ name)
+        if not (isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name)):
+            return False
+        return not (st.targets[0].id.startswith("_") and st.targets[0].id.endswith("_"))
+
+    def aligned(x, y, in_class):
+        """Bodies that differ by defs moved within the body (the same def elsewhere) and, in an undecorated class, by
+        constants gained or lost: the pairs of statements whose text differs, or None."""
+        import difflib
+        kx = [(s.col_offset, s.end_col_offset, tuple(seg(la, s)[2])) for s in x]
+        ky = [(t.col_offset, t.end_col_offset, tuple(seg(lb, t)[2])) for t in y]
+        pairs, gone, new = [], [], []
+        for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, kx, ky, autojunk=False).get_opcodes():
+            if op == "equal":
+                continue
+            if op == "replace" and i2 - i1 == j2 - j1 and all(kind(s) == kind(t) for s, t in zip(x[i1:i2], y[j1:j2])):
+                pairs += zip(x[i1:i2], y[j1:j2])
+            else:
+                gone += x[i1:i2]
+                new += y[j1:j2]
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+        if sorted(ast.dump(s) for s in gone if isinstance(s, defs)) != sorted(
+                ast.dump(t) for t in new if isinstance(t, defs)):
+            return None
+        if any(not isinstance(st, defs) and not (in_class and constant(st)) for st in gone + new):
+            return None
+        return pairs
     top = differing(a.body, b.body)
-    if top is None:
-        return False
-    if all(ast.dump(s) == ast.dump(t) for s, t in top):
+    moved = top is None
+    if moved:
+        top = aligned(a.body, b.body, False)
+        if top is None:
+            return False
+    if not moved and all(ast.dump(s) == ast.dump(t) for s, t in top):
         return None
 
     def blank1(st):
@@ -2200,6 +2388,8 @@ def values_only_by_statement(a, b, la, lb):
             if not head:
                 return False
             inner = differing(bs, bt)
+            if inner is None:
+                inner = aligned(bs, bt, not s.decorator_list)
             return inner is not None and all(same(x, y) for x, y in inner)
         blank1(s)
         blank1(t)
@@ -2207,10 +2397,51 @@ def values_only_by_statement(a, b, la, lb):
     return all(same(s, t) for s, t in top)
 
 
+_WORD = re.compile(r"(\W+)")
+
+
+def renames(text):
+    """{new: old} identifier renames that explain every changed line of an in-place patch (lines replaced one for one,
+    each differing from the old only in identifiers, each new name always replacing the same old one), or None."""
+    pairs = {}
+    for old, new, blocks in parse_patch(text):
+        if not old or new != old:
+            return None
+        for removed, added, _ in blocks:
+            if len(removed) != len(added):
+                return None
+            for (_, a), b in zip(removed, added):
+                ta, tb = _WORD.split(a), _WORD.split(b)
+                if len(ta) != len(tb):
+                    return None
+                for x, y in zip(ta, tb):
+                    if x != y and not (x.isidentifier() and y.isidentifier() and pairs.setdefault(y, x) == x):
+                        return None
+    return pairs or None
+
+
+def novel_renames(m, text):
+    """renames(text) when every new name is unknown to the pinned tree (no sqlglot or test file has the word) and
+    cannot be found by a name the code builds (`*_sql` dispatch, dunders, _sunder_ names), or None."""
+    rn = renames(text)
+    if not rn or set(rn) & set(rn.values()):
+        return None
+    for new in rn:
+        if new.endswith("_sql") or (new.startswith("_") and new.endswith("_")):
+            return None
+    pat = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(rn)) + r")\b")
+    for p in m.d.get("src", {}):
+        s = m.source(p)
+        if s is None or pat.search(s):
+            return None
+    return rn
+
+
 def key_job(m, text):
     """{"files": {path: patched text}, "data": [paths]} for a change that edits values of assignments in sqlglot
-    modules, besides comments there and .sql fixtures (whose readers stay), or None."""
-    files, data, real = {}, [], False
+    modules, besides comments there and .sql fixtures (whose readers stay), or None. With "renames" ({new: old})
+    for a change that renames identifiers to new names (the key check prices the functions it touched)."""
+    files, data, real, rn = {}, [], False, False
     for old, new, blocks in parse_patch(text):
         if not old or new != old:
             return None
@@ -2220,6 +2451,12 @@ def key_job(m, text):
             src = m.source(old)
             nt = patched(src, blocks) if src is not None else None
             v = values_only(src, nt) if nt is not None else False
+            if v is False and nt is not None:
+                if rn is False:
+                    rn = novel_renames(m, text)
+                if rn and re.sub(r"\b(?:" + "|".join(re.escape(n) for n in sorted(rn)) + r")\b",
+                                 lambda mt: rn[mt.group(0)], nt) == src:
+                    v = True
             if v is False:
                 return None
             real = real or v
@@ -2228,7 +2465,12 @@ def key_job(m, text):
             data.append(old)
         else:
             return None
-    return {"files": files, "data": data} if real else None
+    if not real:
+        return None
+    job = {"files": files, "data": data}
+    if rn:
+        job["renames"] = rn
+    return job
 
 
 # Set plans. When the key check of a commit finds that every import-time difference is a plain value (None, bool,
@@ -2289,6 +2531,38 @@ def diff_values(r):
         except Exception:  # noqa: BLE001
             continue
         out[k] = text
+    return out
+
+
+def shadows(r):
+    """In a key-check child, after key_diff: for each attribute a class's own namespace gained, [the key of the one
+    it now hides (module.qualname.name of the first class after it in its MRO that defines the name) or None,
+    whether both are the same plain value]."""
+    out = {}
+    for k, mod, gone, a, b in r.get("diffs", ()):
+        if gone or a is not None or b is None or b[1] != "V" or not b[3]:
+            continue
+        head = f"{b[2]}.{b[3]}."
+        name = k[len(head):] if k.startswith(head) else ""
+        mo = sys.modules.get(b[2])
+        if not name or "." in name or mo is None:
+            continue
+        o = mo
+        for q in b[3].split("."):
+            o = getattr(o, q, None)
+        if not isinstance(o, type) or o.__module__ != b[2] or o.__qualname__ != b[3] or name not in o.__dict__:
+            continue
+        v = o.__dict__[name]
+        out[k] = [None, False]
+        for base in o.__mro__[1:]:
+            if name in base.__dict__:
+                w = base.__dict__[name]
+                try:
+                    same = _plain(v) and _plain(w) and type(v) is type(w) and v == w and repr(v) == repr(w)
+                except Exception:  # noqa: BLE001
+                    same = False
+                out[k] = [f"{base.__module__}.{base.__qualname__}.{name}", bool(same)]
+                break
     return out
 
 
@@ -2358,10 +2632,69 @@ def key_check():
     return 0
 
 
-def key_readers(m, diffs, by_key):
+def def_readers(m, mod, qual, name, depth=0):
+    """The tests that ran the body of `def name` written in module `mod` (in class path `qual`, or at module level
+    when qual is "", also through one `from X import name`), from the map's run spans, as a set; None when no such
+    def is written there."""
+    base = mod.replace(".", "/")
+    path = next((p for p in (base + ".py", base + "/__init__.py") if p in m.d["files"]), None)
+    src = m.source(path) if path else None
+    if src is None:
+        return None
+    try:
+        body = ast.parse(src).body
+    except (SyntaxError, ValueError):
+        return None
+    for q in qual.split(".") if qual else ():
+        c = next((s for s in body if isinstance(s, ast.ClassDef) and s.name == q), None)
+        if c is None:
+            return None
+        body = c.body
+    defs = [s for s in body if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == name]
+    if not defs:
+        if qual or depth:
+            return None
+        for s in body:
+            if not isinstance(s, ast.ImportFrom):
+                continue
+            orig = next((x.name for x in s.names if (x.asname or x.name) == name), None)
+            if orig is None:
+                continue
+            pkg = mod if path.endswith("/__init__.py") else mod.rpartition(".")[0]
+            for _ in range(max(s.level - 1, 0)):
+                pkg = pkg.rpartition(".")[0]
+            src_mod = (pkg + "." + s.module if s.module else pkg) if s.level else s.module
+            return def_readers(m, src_mod, "", orig, 1) if src_mod else None
+        return None
+    rt, sel = m.spans(path, "rt"), 0
+    for d in defs:
+        for x in range(d.body[0].lineno, d.end_lineno + 1):
+            r = rt.find(x)
+            if r is not None:
+                sel |= m.set(r[2])
+    return {n for n in range(m.n) if sel >> n & 1}
+
+
+def key_readers(m, diffs, by_key, shadow=None, renamed=None):
     """The tests that read an entry the change touched (also its size or key order where those changed), the tests
-    the map could not follow, or a string saying why the change cannot be narrowed."""
+    the map could not follow, or a string saying why the change cannot be narrowed.
+    A class constant a class gained (`shadow`: what it hides) is read wherever the hidden one was read through the
+    class (the map's reads count every lookup that reached the hidden one); one with the same value changes no read.
+    A class constant a class lost was read only where its own reads were."""
     km = m.d["keys"]
+    shadow = shadow or {}
+    renamed_tests = set()
+    if renamed:
+        # a test file that names an old name may import it with the module (then all its tests fail) or use it
+        # without a call: all its tests; a helper under tests/ that names one: no narrowing
+        pat = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in sorted(set(renamed.values()))) + r")\b")
+        for p in m.d.get("src", {}):
+            if p.startswith("tests/") and p.endswith(".py") and pat.search(m.source(p) or ""):
+                sid = m.d["file_tests"].get(p)
+                if sid is None:
+                    return f"a test helper names a renamed name: {p}"
+                mask = m.set(sid)
+                renamed_tests.update(n for n in range(m.n) if mask >> n & 1)
     cache = km.setdefault("_r", {})
     keep = set(km["u"])
 
@@ -2406,6 +2739,38 @@ def key_readers(m, diffs, by_key):
             continue  # reached only through a failed module, or the package's name for it: its users are in
         if k.endswith("::order") and k[: -len("::order")] == mod:
             continue  # the order of a module's globals (names added, moved or gone): nothing reads it at run time
+        if k.endswith("::order") and a is not None and b is not None and not failed:
+            continue  # the order of a class's own namespace (names added, moved or gone): nothing reads it at run
+            # time (sqlglot reads class namespaces only in metaclasses at import, whose results show as other keys)
+        if renamed and not failed and (a or b)[1] in ("F", "GF"):
+            # a rename to new names: a function that changed or went is read where its pinned body ran (its users
+            # call it); one under a new name has no reader but the functions that changed to call it
+            name = k.rpartition(":")[2] if (a or b)[1] == "GF" else k.rpartition(".")[2]
+            if a is None:
+                if name in renamed:
+                    continue
+                return f"a new function: {k}"
+            got = def_readers(m, a[2], a[3], name)
+            if got is None:
+                return f"a function the map cannot place: {k}"
+            keep.update(got)
+            continue
+        if a is None and b is not None and k in shadow and not failed:
+            hid, same = shadow[k]
+            if same or (hid is None and renamed and k.rpartition(".")[2] in renamed):
+                continue
+            st = km["h"].get(hid) if hid else None
+            r = table(st) if st is not None and st not in km["no"] else {}
+            if "#v" not in r:
+                return f"a new class constant hides one the map does not follow: {k}"
+            keep.update(r["#v"])
+            continue
+        if gone and a is not None and a[1] == "V" and not failed:
+            st = km["h"].get(k)
+            r = table(st) if st is not None and st not in km["no"] else {}
+            if "#v" in r:
+                keep.update(r["#v"])
+                continue
         if failed and a is None and (tail(k), b[0], b[1]) in gone_recs:
             continue
         pkg, _, name = k.partition(":")
@@ -2430,6 +2795,7 @@ def key_readers(m, diffs, by_key):
         keep.update(r.get("#w", ()))
         for sk in ch:
             keep.update(r.get({"#n": "#l", "#order": "#k"}.get(sk, sk), ()))
+    keep.update(renamed_tests)
     return keep
 
 
@@ -4677,7 +5043,7 @@ def key_phase(m, tests, ms, rows, out):
         if not r or "why" in r:
             print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
             continue
-        keep = key_readers(m, r["diffs"], r["by_key"])
+        keep = key_readers(m, r["diffs"], r["by_key"], r.get("shadow"), jobs[stem].get("renames"))
         if isinstance(keep, str):
             print(f"{stem}: key check keeps all: {keep}", file=sys.stderr)
             continue
