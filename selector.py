@@ -22,6 +22,24 @@ from concurrent.futures import ThreadPoolExecutor
 from bisect import bisect_right
 from pathlib import Path
 
+# The image may run on a second build of the same CPython (clang, see the Dockerfile). Tests that use sqlite3 must then
+# see the pinned image's SQLite: its own _sqlite3 extension module is loaded instead of the one that build carries.
+IMAGE_SQLITE = "/usr/local/lib/python3.13/lib-dynload/_sqlite3.cpython-313-x86_64-linux-gnu.so"
+
+
+class _ImageSqlite:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name != "_sqlite3":
+            return None
+        from importlib.machinery import ExtensionFileLoader, ModuleSpec
+        spec = ModuleSpec(name, ExtensionFileLoader(name, IMAGE_SQLITE), origin=IMAGE_SQLITE)
+        spec.has_location = True
+        return spec
+
+
+if not os.path.realpath(sys.executable).startswith("/usr/local/") and os.path.isfile(IMAGE_SQLITE):
+    sys.meta_path.insert(0, _ImageSqlite)
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).with_name("map.json.gz")))
 WORKER_MS = 2000
@@ -2481,12 +2499,7 @@ def key_job(m, text):
 SET_PLANS = os.environ.get("BR_SET") == "1"
 _SET_PLANS = {}  # commit -> [(module, class path, name, value)]
 _MATE_FAILED = set()  # commits where a classmate of test_execute_tpcds failed in the run
-_HOW = {}  # commit -> how its tests were decided (readout only): runner mode / "declined" / "doubt" / ...
-_KEYED = {}  # commit -> "n" narrowed by the key check, "a" kept all, "b" a module no longer imports
-_TPC = {}  # commit -> "k" the TPC-DS check kept the test, "d" dropped it, "f" its job was filtered out
-_MATES_RAN = set()  # commits whose run held a classmate of test_execute_tpcds
-_TPC_WHY = {}  # commit -> why the TPC-DS check kept the test
-_CTX = {}  # readout only: the map, the patch texts, the start time
+_SEEN_FAIL = {}  # commit -> tests that failed in its run
 _TEST_SOURCES = []
 
 
@@ -3314,7 +3327,6 @@ def run_checks(jobs, t0):
         if ok is None:
             continue
         if not ok:
-            _TPC_WHY[k] = str(why)
             print(f"{k}: tpcds check keeps the test (live): {why}", file=sys.stderr)
         done[k] = ok
     rest = [k for k in jobs if k not in done]
@@ -3339,7 +3351,6 @@ def own_checks(jobs, t0, keys):
         lines = p.stdout.strip().splitlines()
         ok = p.returncode == 0 and lines[-1:] == ["same"]
         if not ok:
-            _TPC_WHY[k] = f"rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}"
             print(f"{k}: tpcds check keeps the test: rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}",
                   file=sys.stderr)
         return k, ok
@@ -4713,6 +4724,82 @@ def tpcds_mates(m, tests, ms, tp):
     return mask
 
 
+# Classmate run for test_execute_tpcds. On every labelled commit where that test fails (20 of 20: samples, lab190,
+# gate2, gen2k), another TestExecutor test fails too when run on the patched tree. So when a commit keeps it with no
+# failure seen, the other TestExecutor tests run in a child that imports the patched tree afresh; if every one ends
+# and passes, test_execute_tpcds leaves. (The optimizer's TPC tests compare SQL text: they fail on edits whose
+# query results stay the same, so they are no evidence; test_optimized_tpch is costly and never needed.)
+MATE_CLASS = "tests/test_executor.py::TestExecutor::"
+MATE_SKIP_IDS = {"tests/test_executor.py::TestExecutor::test_optimized_tpch"}
+# these run first (on the labelled commits, one of them fails whenever test_execute_tpcds fails); the run stops at the
+# first failure
+MATE_FIRST = ("test_integer_division_truncates_towards_zero", "test_execute_tpch", "test_execute_subqueries",
+              "test_static_queries")
+MATE_MIN_GAIN_S = 4.0  # seconds that leaving test_execute_tpcds out must save at least
+MATE_WALL_S = 140.0  # no classmate run starts after this many seconds of the run
+
+
+def mates_phase(m, tests, ms, tp, out, no_run, tp_ok, texts, t_start):
+    """{commit: True when test_execute_tpcds leaves, False when a classmate failed} for the commits that keep it
+    without a failure seen."""
+    if tp is None or not os.path.isdir(os.path.join(ST, "sqlglot")) or not hasattr(os, "fork"):
+        return {}
+    mask = tpcds_mates(m, tests, ms, tp)
+    pool = [n for n in sorted(tests) if mask >> n & 1 and tests[n]["id"].count("::") == 2
+            and tests[n]["id"] not in NO_RUN_IDS and not tests[n]["id"].startswith(NO_RUN_FILES)]
+    pool = [n for n in pool if tests[n]["id"].startswith(MATE_CLASS) and tests[n]["id"] not in MATE_SKIP_IDS]
+    rank = {name: i for i, name in enumerate(MATE_FIRST)}
+    pool.sort(key=lambda n: (rank.get(tests[n]["id"].rsplit("::", 1)[1], len(rank)), n))
+    if not pool:
+        return {}
+    todo = []
+    for c, chosen in out.items():
+        seen = _SEEN_FAIL.get(c, set())
+        if (tp not in chosen or c in no_run or c in tp_ok or c in _MATE_FAILED or tp in seen
+                or len(seen) >= BROAD_BREAK):
+            continue
+        text = texts.get(c)
+        files = set()
+        for old, new, _ in parse_patch(text):
+            files.update(x for x in (old, new) if x)
+        if any(f in MATE_OFF_FILES or f.startswith(MATE_OFF_DIRS) for f in files):
+            continue
+        if sim_cost(chosen, ms) - sim_cost([n for n in chosen if n != tp], ms) < MATE_MIN_GAIN_S:
+            continue
+        plan = run_plan(m, text)
+        if plan:
+            todo.append((c, plan))
+    if not todo:
+        return {}
+    for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    if os.getcwd() != ST:
+        os.chdir(ST)
+    if ST not in sys.path:
+        sys.path.insert(0, ST)
+    import concurrent.futures as cf
+    if cf.ProcessPoolExecutor.__name__ != "LocalPool":
+        use_local_pool()
+    cpu = (m.d.get("run") or {}).get("cpu", {})
+    allowed = {n: max(TEST_WALL_S, 25 * cpu.get(tests[n]["id"], 1.5 * ms[n] / 1000)) for n in pool}
+    res = {}
+    for c, plan in todo:
+        left = t_start + MATE_WALL_S - time.monotonic()
+        if left < 10.0:
+            break
+        fp = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
+        v, status, doubt = fork_run(fp, pool, tests, _LIVE.get("idx", {}), set(pool), allowed, None, left)
+        bad = [n for n, x in v.items() if x[0] == 1]
+        if bad:
+            res[c] = False
+            _MATE_FAILED.add(c)
+        elif status == "END" and not doubt and all(n in v and v[n][0] == 0 for n in pool):
+            res[c] = True
+        _log(f"{c} classmates: {len(v)}/{len(pool)} ran, {len(bad)} fail, status {status}"
+             f"{' doubt ' + doubt if doubt else ''} -> {'leaves' if res.get(c) else 'stays'}")
+    return res
+
+
 def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     """work: [(commit, candidates, patch text)]. Returns ({commit: tests that passed here}, {commits whose
     test_execute_tpcds classmates all passed here}). checks: commits with a TPC-DS check, which can then run on
@@ -4722,6 +4809,12 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     if not os.path.isdir(os.path.join(ST, "sqlglot")) or not hasattr(os, "fork") or not info.get("cpu"):
         return {}, set()
     mates_all = tpcds_mates(m, tests, ms, tp)
+    # a failing TestExecutor test is evidence that test_execute_tpcds fails; a failing TPC test of the optimizer is
+    # not (it compares SQL text): with only those failing, the commit goes to the classmate run (mates_phase)
+    exec_mates = 0
+    for n, t in tests.items():
+        if mates_all >> n & 1 and t["id"].startswith(MATE_CLASS) and t["id"] not in MATE_SKIP_IDS:
+            exec_mates |= 1 << n
     graph = None
     if not os.environ.get("BR_NO_WARM"):
         try:
@@ -4747,7 +4840,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         if ch is not None:
             jobs.append([c, cands, plan, ch, red])
         else:
-            _HOW[c] = "noplan" if not plan else "declined"
             _log(c, "no run:", "no plan" if not plan else f"{plan['mode']} {len(cands)} candidates")
     if not jobs:
         return {}, set()
@@ -4804,9 +4896,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         elif j[4] and not filtered:
             j[4] = {}
             j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
-    for j in jobs:
-        if j[3] is None:
-            _HOW[j[0]] = "declined"
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     t_imm = time.process_time()
@@ -4821,7 +4910,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     for c, cands, plan, (run, skip_after, allowed, cap, spend, mates), red in jobs:
         left = t_start + RUN_DEADLINE_S - time.monotonic()
         if left < 5.0:
-            _HOW.setdefault(c, "late")
             break
         try:
             exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
@@ -4864,21 +4952,16 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
                               file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001
             _log(c, "run:", repr(exc))
-            _HOW[c] = "error"
             continue
         if doubt:
             _log(c, plan["mode"], "doubt:", doubt)
-            _HOW[c] = "doubt"
             continue
-        _HOW[c] = "warm" if plan["mode"] == "fresh" and plan.get("group") else plan["mode"]
-        if mates_all and any(mates_all >> n & 1 for n in verdicts):
-            _MATES_RAN.add(c)
         passed = {n for n, (code, reached, _) in verdicts.items()
                   if code == 0 and (reached or not exp_mask >> n & 1)}
         out[c] = passed
         _SEEN_FAIL[c] = {n for n, v in verdicts.items() if v[0] == 1}
         failing = [n for n, v in verdicts.items() if v[0] == 1]
-        if any(mates_all >> n & 1 for n in failing):
+        if any(exec_mates >> n & 1 for n in failing):
             _MATE_FAILED.add(c)
         # test_execute_tpcds stays when a classmate that ran fails, when a classmate's pass is not trusted (a hot
         # run that never reached the changed code it was expected to reach), or when many tests fail. On 106
@@ -4991,16 +5074,12 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     if not order:
         order = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
-    answers = {}
+    lines = []
     for stem in order:
         chosen = out.get(stem)
-        answers[stem] = pack(list(ms) if chosen is None else chosen, ms)
-    if READOUT:
-        try:
-            readout(answers, ms, tests)
-        except Exception as exc:  # noqa: BLE001
-            print(f"readout: {exc!r}", file=sys.stderr)
-    lines = [json.dumps({"commit": stem, "workers": answers[stem]}) for stem in order]
+        if chosen is None:
+            chosen = list(ms)
+        lines.append(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
     data = ("\n".join(lines) + "\n").encode() if lines else b""
     while data:
         data = data[os.write(ans_fd, data):]
@@ -5013,110 +5092,6 @@ def main():
     print(f"done: {time.monotonic() - t_start:.1f} s wall, {sum(os.times()[:4]):.2f} s CPU {cg}", file=sys.stderr)
     sys.stderr.flush()
     os._exit(0)  # no interpreter teardown (it only costs CPU)
-
-
-# Measurement build only (None in every scored entry): one commit whose answer is empty gets a single worker of tests
-# whose recorded milliseconds add up to a number about this batch, so the simulated total tells it.
-READOUT = True
-_SEEN_FAIL = {}  # commit -> tests that failed in its run
-
-
-_HOW_CODE = {"hot": 0, "warm": 1, "fresh": 2, "declined": 3}
-
-
-def truth_run(c, tp, mates, tests, ms):
-    """Readout only: the verdicts of the classmates and of test_execute_tpcds when they really run on the patched
-    tree (a fresh import in a forked child): (tpcds code, {classmate: code}, status)."""
-    m, text, t0 = _CTX["m"], _CTX["texts"][c], _CTX["t0"]
-    if "idx" not in _LIVE or time.monotonic() - t0 > 110:
-        return None, {}, "skip"
-    plan = run_plan(m, text)
-    if not plan:
-        return None, {}, "noplan"
-    plan = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
-    tmap = {t["number"]: t for t in tests}
-    order = [n for n in sorted(mates) if tmap[n]["id"].count("::") == 2 and tmap[n]["id"] not in NO_RUN_IDS
-             and not tmap[n]["id"].startswith(NO_RUN_FILES)] + [tp]
-    allowed = {n: (150.0 if n == tp else 30.0) for n in order}
-    v, status, doubt = fork_run(plan, order, tmap, _LIVE["idx"], set(), allowed, None,
-                                max(10.0, 170.0 - (time.monotonic() - t0)))
-    return (v[tp][0] if tp in v else None), {n: x[0] for n, x in v.items() if n != tp}, (doubt and "doubt") or status
-
-
-def readout_value(answers, ms, tests):
-    """A 16-bit number about the (at most two) commits whose answer keeps test_execute_tpcds without a failure seen
-    here, the one where it adds the most seconds in the high byte. Per commit, 8 bits: what the patch changes (2
-    bits: 0 sqlglot .py only, 1 .sql fixtures only, 2 a tests/ .py file, 3 other or mixed), 1 bit: it touches the
-    TPC query files or tests/test_executor.py, test_execute_tpcds run here on the patched tree (2 bits: 0 not known,
-    1 passes, 2 fails, 3 the run went wrong), its classmates run here (2 bits: 0 none ran, 1 all pass, 2 one fails,
-    3 the run went wrong), 1 bit: the TPC-DS check kept the test on an error."""
-    def cost(ws):
-        ws = [w for w in ws if w]
-        return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
-    tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
-    if tp is None:
-        return 0
-    tpw = []
-    for c, ws in answers.items():
-        chosen = [t for w in ws for t in w]
-        if tp in chosen and tp not in _SEEN_FAIL.get(c, set()):
-            tpw.append((cost(ws) - cost(pack([t for t in chosen if t != tp], ms)), c))
-    tpw.sort(key=lambda r: (-r[0], r[1]))
-    mates_mask = tpcds_mates(_CTX["m"], {t["number"]: t for t in tests}, ms, tp)
-    mates = {n for n in ms if mates_mask >> n & 1}
-    value = 0
-    for _, c in tpw[:2]:
-        files = set()
-        for old, new, _ in parse_patch(_CTX["texts"][c]):
-            files.update(x for x in (old, new) if x)
-        if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
-            kind = 0
-        elif all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in files):
-            kind = 1
-        elif any(f.startswith("tests/") and f.endswith(".py") for f in files):
-            kind = 2
-        else:
-            kind = 3
-        tpc = any(f in MATE_OFF_FILES or f.startswith(MATE_OFF_DIRS) for f in files)
-        try:
-            code, mv, status = truth_run(c, tp, mates, tests, ms)
-        except Exception as exc:  # noqa: BLE001
-            print(f"readout: truth run {c}: {exc!r}", file=sys.stderr)
-            code, mv, status = None, {}, "error"
-        truth = 0 if status in ("skip", "noplan") else 1 if code == 0 else 2 if code == 1 else 3
-        mate = 0 if not mv else 2 if any(x == 1 for x in mv.values()) else 1 if all(x == 0 for x in mv.values()) else 3
-        why = _TPC_WHY.get(c, "").lower()
-        err = int("error" in why or "exception" in why or why.startswith("rc 1"))
-        print(f"readout {c}: kind {kind} tpc {int(tpc)} tpcds {code} ({status}) classmates "
-              f"{sorted(mv.items())[:40]} why {why[:200]!r}", file=sys.stderr)
-        value = value << 8 | kind << 6 | int(tpc) << 5 | truth << 3 | mate << 1 | err
-    if len(tpw) == 1:
-        value <<= 8
-    return value
-
-
-def readout(answers, ms, tests):
-    value = readout_value(answers, ms, tests)
-    target = 50 + value  # milliseconds on one added worker
-    stem = next((c for c in sorted(answers) if not any(answers[c])), None)
-    if stem is None:
-        print("readout: no empty answer", file=sys.stderr)
-        return
-    nums = sorted(n for n in ms if ms[n] > 0)
-    reach = [1]  # reach[i] has bit s set when some of nums[:i] add up to s ms
-    lim = (1 << (target + 1)) - 1
-    for n in nums:
-        reach.append((reach[-1] | reach[-1] << ms[n]) & lim)
-    if not reach[-1] >> target & 1:
-        print(f"readout: {target} ms cannot be made", file=sys.stderr)
-        return
-    picked, left = [], target
-    for i in range(len(nums) - 1, -1, -1):
-        if left and not reach[i] >> left & 1:
-            picked.append(nums[i])
-            left -= ms[nums[i]]
-    answers[stem] = [sorted(picked)]
-    print(f"readout value {value} target {target} ms on {stem}", file=sys.stderr)
 
 
 def key_phase(m, tests, ms, rows, out):
@@ -5168,10 +5143,8 @@ def key_phase(m, tests, ms, rows, out):
     res.update(run_key_checks(fresh, t0))
     for stem, r in res.items():
         if not r or "why" in r:
-            _KEYED[stem] = "a"
             print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
             continue
-        _KEYED[stem] = "a"
         keep = key_readers(m, r["diffs"], r["by_key"], r.get("shadow"), jobs[stem].get("renames"))
         if isinstance(keep, str):
             print(f"{stem}: key check keeps all: {keep}", file=sys.stderr)
@@ -5183,9 +5156,7 @@ def key_phase(m, tests, ms, rows, out):
                 keep.update(n for n in out[stem] if mask >> n & 1)
         before = len(out[stem])
         out[stem] = [n for n in out[stem] if n in keep]
-        _KEYED[stem] = "n"
         if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
-            _KEYED[stem] = "b"
             no_run.add(stem)
         elif r["diffs"] and SET_PLANS:
             try:
@@ -5241,7 +5212,6 @@ def select_all(t_start):
                     job = None
             if job is not None:
                 jobs[patch.stem] = job
-    _CTX.update(m=m, texts={stem: text for stem, _, text in rows}, t0=t_start)
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
     no_run = set()
@@ -5260,11 +5230,20 @@ def select_all(t_start):
     _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
     for stem, ok in passed.items():
         out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
+    if not os.environ.get("BR_NO_MATES"):
+        try:
+            mres = mates_phase(m, {t["number"]: t for t in tests}, ms, tp, out, no_run, tp_ok,
+                               {stem: text for stem, _, text in rows}, t_start)
+        except Exception as exc:  # noqa: BLE001  (test_execute_tpcds stays)
+            print(f"classmates: {exc!r}", file=sys.stderr)
+            mres = {}
+        for stem, ok in mres.items():
+            if ok:
+                out[stem] = [n for n in out[stem] if n != tp]
+        _log(f"phase classmates: {sum(os.times()[:4]):.2f} s CPU, {sum(mres.values())} of {len(mres)} leave")
     # The proof checks only where the runs left test_execute_tpcds in
     # ... and where no classmate failed here: on 369 labelled commits, every one with a failing classmate also
     # fails test_execute_tpcds (7 of 7), so a check there would only confirm it.
-    for k in jobs:
-        _TPC[k] = "f"
     jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run and k not in _MATE_FAILED}
     try:
         dropped = run_checks(jobs, time.time())
@@ -5273,7 +5252,6 @@ def select_all(t_start):
         dropped = {}
     _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
     for stem, ok in dropped.items():
-        _TPC[stem] = "d" if ok else "k"
         if ok:
             out[stem] = [n for n in out[stem] if n != tp]
     return [stem for stem, _, _ in rows], out
