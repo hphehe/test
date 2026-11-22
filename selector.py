@@ -4139,7 +4139,7 @@ RUN_DEADLINE_S = float(os.environ.get("BR_RUN_WALL", 150))  # no child runs past
 HOLD_FLOOR_S = 1.5  # a test runs when its CPU cost is below max(this, RUN_SHARE * (2 s + its recorded seconds))
 RUN_SHARE = 0.7
 RUN_LEVELS_S = []  # smaller run sets to weigh against the budget's (v23 tried 0, 0.5, 1, 2, 4 s: board CPU +3, sim −0.4)
-HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of test runs per commit
+HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 4.0))  # CPU seconds of test runs per commit
 FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
 FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
 AFTER_FAIL = 0.5  # once a test failed, a test runs only when it costs less than this share of its recorded seconds
@@ -4210,41 +4210,6 @@ MATE_LONG_MS = 15000  # classmates are tests recorded at most this long
 MATE_OFF_FILES = ("tests/test_executor.py",)  # the test's own code: its classmates say nothing about it
 MATE_OFF_DIRS = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")
 CO_OPTIMIZED = 0x1
-
-
-_PH = {}  # probe only: process CPU (with waited children) at the end of each phase
-
-
-def phase_readout(answers, ms):
-    """Probe only: the first commit whose answer is empty gets one worker of tests adding up to 50 + V ms, where V
-    holds the CPU of the phases in fixed steps: select (0.25 s, 3 bits) << 13 | keys (0.5 s, 4 bits) << 9 | runs
-    (0.5 s, 5 bits) << 4 | checks (0.5 s, 4 bits)."""
-    def q(x, unit, bits):
-        return max(0, min((1 << bits) - 1, int(round(x / unit))))
-    s = _PH.get("select", 0.0)
-    k = _PH.get("keys", s)
-    r = _PH.get("runs", k)
-    c = _PH.get("checks", r)
-    value = q(s, 0.25, 3) << 13 | q(k - s, 0.5, 4) << 9 | q(r - k, 0.5, 5) << 4 | q(c - r, 0.5, 4)
-    target = 50 + value
-    stem = next((x for x in sorted(answers) if not any(answers[x])), None)
-    if stem is None:
-        return
-    nums = sorted(n for n in ms if ms[n] > 0)
-    reach = [1]
-    lim = (1 << (target + 1)) - 1
-    for n in nums:
-        reach.append((reach[-1] | reach[-1] << ms[n]) & lim)
-    if not reach[-1] >> target & 1:
-        return
-    picked, left = [], target
-    for i in range(len(nums) - 1, -1, -1):
-        if left and not reach[i] >> left & 1:
-            picked.append(nums[i])
-            left -= ms[nums[i]]
-    answers[stem] = [sorted(picked)]
-    print(f"readout value {value} target {target} ms on {stem} phases {s:.2f} {k - s:.2f} {r - k:.2f} {c - r:.2f}",
-          file=sys.stderr)
 
 
 def _log(*a):
@@ -5796,17 +5761,12 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     if not order:
         order = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
-    answers = {}
+    lines = []
     for stem in order:
         chosen = out.get(stem)
         if chosen is None:
             chosen = list(ms)
-        answers[stem] = pack(chosen, ms)
-    try:
-        phase_readout(answers, ms)
-    except Exception as exc:  # noqa: BLE001
-        print(f"readout: {exc!r}", file=sys.stderr)
-    lines = [json.dumps({"commit": stem, "workers": answers[stem]}) for stem in order]
+        lines.append(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
     data = ("\n".join(lines) + "\n").encode() if lines else b""
     while data:
         data = data[os.write(ans_fd, data):]
@@ -5940,14 +5900,14 @@ def select_all(t_start):
                     job = None
             if job is not None:
                 jobs[patch.stem] = job
-    _PH["select"] = sum(os.times()[:4]); _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
+    _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
     no_run = set()
     try:
         no_run = key_phase(m, tests, ms, rows, out)
     except Exception as exc:  # noqa: BLE001  (no narrowing)
         print(f"key checks: {exc!r}", file=sys.stderr)
-    _PH["keys"] = sum(os.times()[:4]); _log(f"phase keys: {sum(os.times()[:4]):.2f} s CPU")
+    _log(f"phase keys: {sum(os.times()[:4]):.2f} s CPU")
     try:
         passed, tp_ok = runner_phase(m, {t["number"]: t for t in tests}, ms,
                                      [(stem, out[stem], text) for stem, _, text in rows if out[stem] and stem not in no_run],
@@ -5955,7 +5915,7 @@ def select_all(t_start):
     except Exception as exc:  # noqa: BLE001  (no runs: the selection as it is)
         print(f"runner: {exc!r}", file=sys.stderr)
         passed, tp_ok = {}, set()
-    _PH["runs"] = sum(os.times()[:4]); _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
+    _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
     for stem, ok in passed.items():
         out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok
                                                                 and not os.environ.get("BR_NO_TP_OK"))]
@@ -5983,7 +5943,7 @@ def select_all(t_start):
     except Exception as exc:  # noqa: BLE001
         print(f"tpcds checks: {exc!r}", file=sys.stderr)
         dropped = {}
-    _PH["checks"] = sum(os.times()[:4]); _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
+    _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
     for stem, ok in dropped.items():
         if ok:
             out[stem] = [n for n in out[stem] if n != tp]
