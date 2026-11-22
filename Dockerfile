@@ -4,10 +4,11 @@ RUN pip install --no-cache-dir --no-deps --disable-pip-version-check --root-user
         duckdb==2.0.0 numpy==2.5.5 pandas==3.1.1 python-dateutil==4.0.0 pytz==2026.6 tzdata==2026.6 \
         typing_extensions==4.16.0 mypy_extensions==1.2.0 \
     || echo "test libraries not installed"
+ENV PYTHONMALLOC=mimalloc MIMALLOC_LARGE_OS_PAGES=1
 COPY selector.py map.json.gz /app/
 RUN python /app/selector.py --prepare /app/sq \
     && (python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/local/lib/python3.13 /app/st \
             /app/selector.py || echo "some files did not compile") \
     && python -c "import py_compile; py_compile.compile('/app/selector.py', cfile='/app/selector.pyc', doraise=True)" \
     && chmod -R a+rX /app
-CMD ["python", "-I", "/app/selector.pyc"]
+CMD ["python", "-s", "-P", "/app/selector.pyc"]

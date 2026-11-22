@@ -1712,8 +1712,11 @@ def graph_main(argv):
 
 def snap_env():
     """The snapshot child's environment: a fixed hash seed (sets of strings iterate the same in both trees)."""
-    return {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": "/tmp", "PYTHONHASHSEED": "0",
-            "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": "/tmp", "PYTHONHASHSEED": "0",
+           "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
+    if os.environ.get("BR_SNAP_ALLOC", "1") == "1":  # the allocator the image sets (build and run alike)
+        env.update((k, v) for k, v in os.environ.items() if k == "PYTHONMALLOC" or k.startswith("MIMALLOC_"))
+    return env
 
 
 def snap_run(root, out, bag_keys=(), pad=0, ents=False):
@@ -1842,7 +1845,7 @@ def key_snap_main(argv):
         r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats})
     with open(out, "w") as fh:
         json.dump(r, fh)
-    return 0
+    os._exit(0)  # no interpreter teardown
 
 
 def key_diff(base, new, scope=None):
@@ -1984,6 +1987,7 @@ def key_server_main(argv):
         rec = base["keys"].get(key)
         return rec is None or rec[0] != whole
     import gc
+    make_immortal()
     gc.freeze()
     for line in sys.stdin:
         job = json.loads(line)
@@ -2026,7 +2030,7 @@ def key_server_main(argv):
                 os._exit(code)
         os.waitpid(pid, 0)
         print("done", flush=True)
-    return 0
+    os._exit(0)  # no interpreter teardown
 
 
 def key_snap(files):
@@ -3012,6 +3016,10 @@ CO_OPTIMIZED = 0x1
 
 def _log(*a):
     if RUN_DEBUG:
+        if os.environ.get("BR_FAULTS"):
+            import resource
+            se, ch = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+            a = a + (f"[faults self {se.ru_minflt} children {ch.ru_minflt}]",)
         print(*a, file=sys.stderr, flush=True)
 
 
@@ -3382,6 +3390,22 @@ def function_index():
             if c.co_filename.startswith(root):
                 idx.setdefault((c.co_filename, c.co_firstlineno, c.co_name), []).append(o)
     return idx
+
+
+def make_immortal():
+    """Give the objects this process holds CPython's never-freed reference count (3.12 and 3.13 on 64-bit skip count
+    updates on such objects), so a forked child stops writing to, and so copying, the parent's memory pages only to
+    count references. Nothing so marked is freed again; the processes that mark end with os._exit."""
+    if (os.environ.get("BR_IMM") == "0" or sys.implementation.name != "cpython"
+            or sys.version_info[:2] not in ((3, 12), (3, 13)) or sys.maxsize < 2 ** 63 - 1):
+        return 0
+    import ctypes
+    import gc
+    put = ctypes.c_ssize_t.from_address
+    objs = gc.get_objects()
+    for o in objs:
+        put(id(o)).value = 0xFFFFFFFF
+    return len(objs)
 
 
 def all_codes(c):
@@ -4186,6 +4210,9 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
             j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
+    t_imm = time.process_time()
+    kept = make_immortal()
+    _log(f"immortal {kept} objects, {time.process_time() - t_imm:.3f} s CPU")
     gc.freeze()
     _LIVE.update(idx=idx, plans={c: p for c, p in plans.items() if p["mode"] == "hot" and c not in hit and not any(
         os.path.join(ST, f) in opened for f in p["files"] if not f.endswith(".py"))})
