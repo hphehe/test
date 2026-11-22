@@ -5312,6 +5312,9 @@ READOUT = True
 _HOW_CODE = {"hot": 0, "warm": 1, "fresh": 2, "declined": 3}
 _TPC_LIVE = {}  # probe: commit -> (where, ok, output lines)
 _TPC_JOB = {}  # probe: commit -> the check job's estimate
+_JOB_ALL = {}  # probe: commit -> its check job before the filter
+_FILT = {}  # probe: commit -> why its job was left out (1 test not in, 2 no_run, 3 seen failing, 4 est over allowed)
+_GAIN = {}  # probe: commit -> the seconds leaving the test out saves after the runs
 
 
 def truth_run(c, tp, mates, tests, ms):
@@ -5339,13 +5342,14 @@ _GAIN_BACK = [0]
 
 
 def readout_value(answers, ms, tests):
-    """Probe 34. V (16 bits) about the .py commit whose TPC-DS check ran (else the .py commit that keeps
-    test_execute_tpcds unseen failing): why the check ended (4 bits: 0 no job, 1 job too costly here or not run,
-    2 PROVED, 3 optimize differs over budget, 4 duckdb sql differs, 5 result differs, 6 RecursionError, 7 other
-    error, 8 live doubt, 9 timed out, 10 own-process failure, 11 parsed deeper, 12 no tables, 13 other), optimized
-    trees that differ (4 bits, cap 15), queries executed (4 bits, cap 15), of them passing only by the test's own
-    comparison (3 bits, cap 7), one that differs (1 bit). When the check proved the pass, the readout worker also
-    carries the seconds that leaving the test out saved, so the base stays the pinned answers'."""
+    """Probe 35. V (16 bits) about #1, the .py commit that keeps test_execute_tpcds unseen failing: why its check job
+    was left out (3 bits: 0 it was not, 1 test not in after the runs, 2 key-check no_run, 3 seen failing, 4 estimate
+    over the allowed, 5 no job at all, 6 a check ran, 7 class job), its estimate (4 bits, 3 s units), the seconds
+    leaving the test out saves after the runs (3 bits, 4 s units), then the check FORCED here with a 40 s execution
+    budget (answers unchanged): how it ended (4 bits: 2 proved, 3 optimize differs over budget, 4 duckdb sql
+    differs, 5 result differs, 6 RecursionError, 7 error, 8 doubt, 9 timed out, 10 own-process failure, 11 parsed
+    deeper, 12 no tables, 13 other, 14 not run), a query passed only by the test's comparison (1 bit),
+    one failed both (1 bit). The readout worker also carries the seconds every drop by the test's comparison saved."""
     def cost(ws):
         ws = [w for w in ws if w]
         return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
@@ -5356,45 +5360,69 @@ def readout_value(answers, ms, tests):
         for old, new, _ in parse_patch(_CTX["texts"][c]):
             files.update(x for x in (old, new) if x)
         return all(f.startswith("sqlglot/") and f.endswith(".py") for f in files)
-    ran = [c for c in sorted(_TPC_LIVE) if py_only(c)]
-    one = max(ran, key=lambda c: _TPC_JOB.get(c, 0.0)) if ran else None
-    if len(ran) > 1:
-        print(f"readout: checks ran on {ran}", file=sys.stderr)
-    if one is None:
-        for c in sorted(answers):
-            chosen = [t for w in answers[c] for t in w]
-            if tp in chosen and tp not in _SEEN_FAIL.get(c, set()) and py_only(c):
-                one = c
-                break
-    if one is None:
-        print("readout: no such commit", file=sys.stderr)
-        return 0xF000
-    r = _TPC_LIVE.get(one)
-    lines = list(r[2]) if r else []
-    if r is None:
-        wc = 0 if _TPC.get(one) is None else 1
-    elif r[1]:
-        wc = 2
-    else:
-        w = " ".join(lines[-1:]).lower()
-        wc = next((code for key, code in _WHY_CODES if key in w), 10 if r[0] == "own" else 13)
-    xs = [ln.split() for ln in lines if ln.startswith("x ")]
-    nx = len(xs)
-    nf = sum(1 for x in xs if x[-1] == "f")
-    nn = int(any(x[-1] == "n" for x in xs))
-    no = sum(1 for ln in lines if ln.startswith("o "))
-    est = _TPC_JOB.get(one, 0.0)
-    # put back what each drop by the test's own comparison saved (and #1's if proved), so the base stays the pinned
-    # answers': the answer with test_execute_tpcds again
     for k, (_, ok, ln) in _TPC_LIVE.items():
-        if ok and (k == one or any(x.startswith("x ") and x.endswith(" f") for x in ln)) and answers.get(k) is not None:
+        if ok and any(x.startswith("x ") and x.endswith(" f") for x in ln) and answers.get(k) is not None:
             chosen = [t for w in answers[k] for t in w]
             if tp not in chosen:
                 _GAIN_BACK[0] += cost(pack(chosen + [tp], ms)) - cost(answers[k])
                 print(f"readout: gain back {k}", file=sys.stderr)
-    print(f"readout: {one} why {wc} est {est:.1f} trees differ {no} executed {nx} test-comparison {nf} differs {nn} gain back "
-          f"{_GAIN_BACK[0]} lines {lines[-6:]}", file=sys.stderr)
-    return wc << 12 | min(no, 15) << 8 | min(nx, 15) << 4 | min(nf, 7) << 1 | nn
+    cands = []
+    for c in sorted(answers):
+        chosen = [t for w in answers[c] for t in w]
+        if tp in chosen and tp not in _SEEN_FAIL.get(c, set()) and py_only(c):
+            cands.append(c)
+    print(f"readout: candidates {[(c, _FILT.get(c), _TPC_JOB.get(c), _GAIN.get(c)) for c in cands]}", file=sys.stderr)
+    if not cands:
+        return 0xFFFF
+    one = cands[0]
+    job = _JOB_ALL.get(one)
+    if one in _TPC_LIVE:
+        filt = 6
+    elif job is None:
+        filt = 5
+    elif job.get("kind") == "cls":
+        filt = 7
+    else:
+        filt = _FILT.get(one, 0)
+    est = _TPC_JOB.get(one, job["est"] if job else 0.0)
+    gain = _GAIN.get(one, 0.0)
+    wc, lines = 14, []
+    if job is not None and job.get("kind") != "cls":
+        job = dict(job)
+        if tables_ready():
+            job["xbudget"] = 40.0
+        plan = _LIVE.get("plans", {}).get(one)
+        if True:
+            try:
+                if plan is None or "idx" not in _LIVE:
+                    p = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--tpcds-check"],
+                                       input=json.dumps(job), capture_output=True, text=True, timeout=90)
+                    lines = p.stdout.strip().splitlines()
+                    ok = p.returncode == 0 and lines[-1:] == ["same"]
+                    if not ok and not lines[-1:]:
+                        lines = lines + ["own " + p.stderr[-200:]]
+                else:
+                    ok, lines = live_check(job, plan, _LIVE["idx"], 90.0)
+                lines = list(lines)
+                if ok:
+                    wc = 2
+                else:
+                    w = " ".join(lines[-1:]).lower()
+                    wc = next((code for key, code in _WHY_CODES if key in w), 8 if ok is None else 13)
+            except subprocess.TimeoutExpired:
+                wc = 9
+            except Exception as exc:  # noqa: BLE001
+                print(f"readout: forced check {exc!r}", file=sys.stderr)
+                wc = 7
+            if plan is None:
+                print("readout: forced check in its own process", file=sys.stderr)
+    xs = [ln.split() for ln in lines if ln.startswith("x ")]
+    nf = int(any(x[-1] == "f" for x in xs))
+    nn = int(any(x[-1] == "n" for x in xs))
+    no = sum(1 for ln in lines if ln.startswith("o "))
+    print(f"readout: {one} filt {filt} est {est:.1f} gain {gain:.1f} forced {wc} trees differ {no} executed {len(xs)} "
+          f"test-comparison {nf} differs {nn} lines {lines[-6:]}", file=sys.stderr)
+    return filt << 13 | min(int(est // 3), 15) << 9 | min(int(gain // 4), 7) << 6 | wc << 2 | nf << 1 | nn
 
 
 def readout(answers, ms, tests):
@@ -5568,6 +5596,8 @@ def select_all(t_start):
     # classmate failed: on the board a commit fails a classmate while test_execute_tpcds passes.
     for k in jobs:
         _TPC[k] = "f"
+        _JOB_ALL[k] = jobs[k]
+        _FILT[k] = (1 if tp not in out.get(k, ()) else 2 if k in no_run else 3 if tp in _SEEN_FAIL.get(k, ()) else 0)
     jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run
             and tp not in _SEEN_FAIL.get(k, ())}
     for k in list(jobs):
@@ -5579,7 +5609,9 @@ def select_all(t_start):
         # second; a check costs ~0.7 of its estimate). Queries whose optimized tree differs may then be executed.
         allowed = max(CHECK_MAX_EST_S, min(CHECK_EST_CAP_S, CHECK_EST_PER_S * gain))
         _TPC_JOB[k] = job["est"]
+        _GAIN[k] = gain
         if job["est"] > allowed:
+            _FILT[k] = 4
             del jobs[k]
             continue
         if tables_ready():
