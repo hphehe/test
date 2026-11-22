@@ -1774,6 +1774,8 @@ def snap_env():
     """The snapshot child's environment: a fixed hash seed (sets of strings iterate the same in both trees)."""
     env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"), "HOME": "/tmp", "PYTHONHASHSEED": "0",
            "PYTHONDONTWRITEBYTECODE": "1", "SKIP_INTEGRATION": "0"}
+    if SET_PLANS:
+        env["BR_SET"] = "1"
     if os.environ.get("BR_SNAP_ALLOC", "1") == "1":  # the allocator the image sets (build and run alike)
         env.update((k, v) for k, v in os.environ.items() if k == "PYTHONMALLOC" or k.startswith("MIMALLOC_"))
     return env
@@ -1903,7 +1905,7 @@ def key_snap_main(argv):
         r = {"why": f"snapshot failed: {exc!r}"}
     else:
         r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats})
-        if "why" not in r:
+        if "why" not in r and SET_PLANS:
             r["values"] = diff_values(r)
     with open(out, "w") as fh:
         json.dump(r, fh)
@@ -2079,7 +2081,7 @@ def key_server_main(argv):
                 keys, bags, stats = snap_state(root, base["unstable"], want, roots=group, errs=new_errs)
                 scope = {k for m in group for k in by_root.get(m, ())} | {DIALECT_TABLE}
                 r = key_diff(base, {"keys": keys, "bags": bags, "stats": stats}, scope)
-                if "why" not in r:
+                if "why" not in r and SET_PLANS:
                     r["values"] = diff_values(r)
                 with open(job["out"], "w") as fh:
                     json.dump(r, fh)
@@ -2233,6 +2235,8 @@ def key_job(m, text):
 # number, str, bytes, and tuples, lists, dicts and sets of those) held by a sqlglot module global or by a class's own
 # namespace, its child also hands back those values. A forked run child can then set them on the objects the runner
 # parent imported instead of importing the patched tree again (a hot plan without code pairs).
+# Off by default: v25 ran them and the board's CPU rose 0.8 s with the simulated time unchanged.
+SET_PLANS = os.environ.get("BR_SET") == "1"
 _SET_PLANS = {}  # commit -> [(module, class path, name, value)]
 _MATE_FAILED = set()  # commits where a classmate of test_execute_tpcds failed in the run
 _TEST_SOURCES = []
@@ -4686,7 +4690,7 @@ def key_phase(m, tests, ms, rows, out):
         out[stem] = [n for n in out[stem] if n in keep]
         if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
             no_run.add(stem)
-        elif r["diffs"] and not os.environ.get("BR_NO_SET"):
+        elif r["diffs"] and SET_PLANS:
             try:
                 sp = set_plan(r)
             except Exception as exc:  # noqa: BLE001
