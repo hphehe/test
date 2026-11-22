@@ -2485,6 +2485,8 @@ _HOW = {}  # commit -> how its tests were decided (readout only): runner mode / 
 _KEYED = {}  # commit -> "n" narrowed by the key check, "a" kept all, "b" a module no longer imports
 _TPC = {}  # commit -> "k" the TPC-DS check kept the test, "d" dropped it, "f" its job was filtered out
 _MATES_RAN = set()  # commits whose run held a classmate of test_execute_tpcds
+_TPC_WHY = {}  # commit -> why the TPC-DS check kept the test
+_CTX = {}  # readout only: the map, the patch texts, the start time
 _TEST_SOURCES = []
 
 
@@ -3312,6 +3314,7 @@ def run_checks(jobs, t0):
         if ok is None:
             continue
         if not ok:
+            _TPC_WHY[k] = str(why)
             print(f"{k}: tpcds check keeps the test (live): {why}", file=sys.stderr)
         done[k] = ok
     rest = [k for k in jobs if k not in done]
@@ -3336,6 +3339,7 @@ def own_checks(jobs, t0, keys):
         lines = p.stdout.strip().splitlines()
         ok = p.returncode == 0 and lines[-1:] == ["same"]
         if not ok:
+            _TPC_WHY[k] = f"rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}"
             print(f"{k}: tpcds check keeps the test: rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}",
                   file=sys.stderr)
         return k, ok
@@ -5020,63 +5024,80 @@ _SEEN_FAIL = {}  # commit -> tests that failed in its run
 _HOW_CODE = {"hot": 0, "warm": 1, "fresh": 2, "declined": 3}
 
 
-def readout_value(answers, ms, tests, which):
-    """A 14-bit number about this batch (measurement build only). which (drawn per run):
-      0  the commit with the most seconds beyond what its tests seen failing here cost, test_execute_tpcds left
-         out of the count: those seconds in 128 ms units (8 bits), how it was decided (3 bits, below), its key
-         check (2 bits: 0 none, 1 narrowed, 2 kept all, 3 a module no longer imports), 1 bit: a test failed in its run
-      1, 2  the commit where test_execute_tpcds, in the answer without a failure seen, adds the most / the second
-         most seconds: those seconds in 512 ms units (6 bits), how it was decided (3 bits), a classmate ran (1), a
-         classmate failed (1), its TPC-DS check (2 bits: 0 none, 1 job filtered out, 2 ran and kept the test),
-         1 bit: a key check ran
-      3  commits with test_execute_tpcds unseen failing (2 bits), commits where a module no longer imports (2),
-         empty answers (3 bits), all seconds beyond the tests seen failing in 1 s units (7 bits)
-    How a commit was decided: 0 hot run, 1 warm run, 2 fresh run, 3 runs declined, 4 a module no longer imports,
-    5 no run otherwise, 6 run doubted or failed, 7 out of time."""
+def truth_run(c, tp, mates, tests, ms):
+    """Readout only: the verdicts of the classmates and of test_execute_tpcds when they really run on the patched
+    tree (a fresh import in a forked child): (tpcds code, {classmate: code}, status)."""
+    m, text, t0 = _CTX["m"], _CTX["texts"][c], _CTX["t0"]
+    if "idx" not in _LIVE or time.monotonic() - t0 > 110:
+        return None, {}, "skip"
+    plan = run_plan(m, text)
+    if not plan:
+        return None, {}, "noplan"
+    plan = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
+    tmap = {t["number"]: t for t in tests}
+    order = [n for n in sorted(mates) if tmap[n]["id"].count("::") == 2 and tmap[n]["id"] not in NO_RUN_IDS
+             and not tmap[n]["id"].startswith(NO_RUN_FILES)] + [tp]
+    allowed = {n: (150.0 if n == tp else 30.0) for n in order}
+    v, status, doubt = fork_run(plan, order, tmap, _LIVE["idx"], set(), allowed, None,
+                                max(10.0, 170.0 - (time.monotonic() - t0)))
+    return (v[tp][0] if tp in v else None), {n: x[0] for n, x in v.items() if n != tp}, (doubt and "doubt") or status
+
+
+def readout_value(answers, ms, tests):
+    """A 16-bit number about the (at most two) commits whose answer keeps test_execute_tpcds without a failure seen
+    here, the one where it adds the most seconds in the high byte. Per commit, 8 bits: what the patch changes (2
+    bits: 0 sqlglot .py only, 1 .sql fixtures only, 2 a tests/ .py file, 3 other or mixed), 1 bit: it touches the
+    TPC query files or tests/test_executor.py, test_execute_tpcds run here on the patched tree (2 bits: 0 not known,
+    1 passes, 2 fails, 3 the run went wrong), its classmates run here (2 bits: 0 none ran, 1 all pass, 2 one fails,
+    3 the run went wrong), 1 bit: the TPC-DS check kept the test on an error."""
     def cost(ws):
         ws = [w for w in ws if w]
         return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
-
-    def how(c):
-        h = _HOW.get(c)
-        if h in _HOW_CODE:
-            return _HOW_CODE[h]
-        if _KEYED.get(c) == "b":
-            return 4
-        return 6 if h in ("doubt", "error", "noplan") else 7 if h == "late" else 5
     tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
-    cap = lambda v, top: max(0, min(top, int(round(v))))  # noqa: E731
-    waste, tpw = [], []
+    if tp is None:
+        return 0
+    tpw = []
     for c, ws in answers.items():
         chosen = [t for w in ws for t in w]
-        seen = _SEEN_FAIL.get(c, set())
-        rest = [t for t in chosen if t != tp or tp in seen]
-        waste.append((cost(pack(rest, ms)) - cost(pack([t for t in rest if t in seen], ms)), c))
-        if len(rest) < len(chosen):
-            tpw.append((cost(ws) - cost(pack(rest, ms)), c))
-    waste.sort(key=lambda r: (-r[0], r[1]))
+        if tp in chosen and tp not in _SEEN_FAIL.get(c, set()):
+            tpw.append((cost(ws) - cost(pack([t for t in chosen if t != tp], ms)), c))
     tpw.sort(key=lambda r: (-r[0], r[1]))
-    key_code = {"n": 1, "a": 2, "b": 3}
-    if which == 0:
-        if not waste or waste[0][0] <= 0:
-            return 0
-        w, c = waste[0]
-        return cap(w / 128, 255) << 6 | how(c) << 3 | key_code.get(_KEYED.get(c), 0) << 1 | int(bool(_SEEN_FAIL.get(c)))
-    if which in (1, 2):
-        if len(tpw) < which:
-            return 0
-        w, c = tpw[which - 1]
-        return (cap(w / 512, 63) << 8 | how(c) << 5 | int(c in _MATES_RAN) << 4 | int(c in _MATE_FAILED) << 3
-                | {"f": 1, "k": 2}.get(_TPC.get(c), 0) << 1 | int(c in _KEYED))
-    total = sum(r[0] for r in waste) + sum(r[0] for r in tpw)
-    return (cap(len(tpw), 3) << 12 | cap(sum(1 for v in _KEYED.values() if v == "b"), 3) << 10
-            | cap(sum(1 for ws in answers.values() if not any(ws)), 7) << 7 | cap(total / 1000, 127))
+    mates_mask = tpcds_mates(_CTX["m"], {t["number"]: t for t in tests}, ms, tp)
+    mates = {n for n in ms if mates_mask >> n & 1}
+    value = 0
+    for _, c in tpw[:2]:
+        files = set()
+        for old, new, _ in parse_patch(_CTX["texts"][c]):
+            files.update(x for x in (old, new) if x)
+        if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
+            kind = 0
+        elif all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in files):
+            kind = 1
+        elif any(f.startswith("tests/") and f.endswith(".py") for f in files):
+            kind = 2
+        else:
+            kind = 3
+        tpc = any(f in MATE_OFF_FILES or f.startswith(MATE_OFF_DIRS) for f in files)
+        try:
+            code, mv, status = truth_run(c, tp, mates, tests, ms)
+        except Exception as exc:  # noqa: BLE001
+            print(f"readout: truth run {c}: {exc!r}", file=sys.stderr)
+            code, mv, status = None, {}, "error"
+        truth = 0 if status in ("skip", "noplan") else 1 if code == 0 else 2 if code == 1 else 3
+        mate = 0 if not mv else 2 if any(x == 1 for x in mv.values()) else 1 if all(x == 0 for x in mv.values()) else 3
+        why = _TPC_WHY.get(c, "").lower()
+        err = int("error" in why or "exception" in why or why.startswith("rc 1"))
+        print(f"readout {c}: kind {kind} tpc {int(tpc)} tpcds {code} ({status}) classmates "
+              f"{sorted(mv.items())[:40]} why {why[:200]!r}", file=sys.stderr)
+        value = value << 8 | kind << 6 | int(tpc) << 5 | truth << 3 | mate << 1 | err
+    if len(tpw) == 1:
+        value <<= 8
+    return value
 
 
 def readout(answers, ms, tests):
-    which = int(os.environ["BR_READOUT_M"]) % 4 if os.environ.get("BR_READOUT_M") else os.urandom(1)[0] % 4
-    value = readout_value(answers, ms, tests, which)
-    target = 50 + 4 * value + which  # milliseconds on one added worker
+    value = readout_value(answers, ms, tests)
+    target = 50 + value  # milliseconds on one added worker
     stem = next((c for c in sorted(answers) if not any(answers[c])), None)
     if stem is None:
         print("readout: no empty answer", file=sys.stderr)
@@ -5095,7 +5116,7 @@ def readout(answers, ms, tests):
             picked.append(nums[i])
             left -= ms[nums[i]]
     answers[stem] = [sorted(picked)]
-    print(f"readout which {which} value {value} target {target} ms on {stem}", file=sys.stderr)
+    print(f"readout value {value} target {target} ms on {stem}", file=sys.stderr)
 
 
 def key_phase(m, tests, ms, rows, out):
@@ -5220,6 +5241,7 @@ def select_all(t_start):
                     job = None
             if job is not None:
                 jobs[patch.stem] = job
+    _CTX.update(m=m, texts={stem: text for stem, _, text in rows}, t0=t_start)
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
     no_run = set()
