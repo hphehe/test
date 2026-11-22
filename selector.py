@@ -1830,6 +1830,14 @@ def xr_record(i):
         order = xr_order(plan)
         if order is None:
             return {"why": "order"}
+        if attempt == 0:
+            # the plan as built, before any step runs (steps may change its trees): a check whose changes run
+            # nowhere before the steps loads it instead of planning again
+            plan_blob = xr_dumps((plan, [s for _, s in order]))
+            p2, s2 = pickle.loads(plan_blob)
+            o2 = xr_order(p2)
+            if o2 is None or [k for k, _ in o2] != [k for k, _ in order] or                     any(a is not b for (_, a), b in zip(o2, s2)) or                     (None if p2.ctes is None else fingerprint(p2.ctes)) !=                     (None if plan.ctes is None else fingerprint(plan.ctes)):
+                plan_blob = None
         pos = {s: j for j, (_, s) in enumerate(order)}
         outs, sets, digs, cpu, blobs, mut = {}, [], [], [], {}, set()
         for j, (_, s) in enumerate(order):
@@ -1855,7 +1863,7 @@ def xr_record(i):
                      "multi": sorted(pos[s] for _, s in order if len(s.dependents) > 1)})
         if attempt == 0:
             with open(os.path.join(out_dir, f"{i}.pkl"), "wb") as fh:
-                pickle.dump({"opt": opt_blob, "out": blobs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dump({"opt": opt_blob, "plan": plan_blob, "out": blobs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
     mon.set_events(XR_TOOL, 0)
     a, b = runs
     if a["keys"] != b["keys"] or a["digs"] != b["digs"] or a["res"] != b["res"] or a["fo"] != b["fo"] or             a["mut"] != b["mut"] or a["ctes"] != b["ctes"]:
@@ -1991,6 +1999,15 @@ def xr_replay(q, ranges, shared_schema, base_of, duck_schema):
     with open(os.path.join(XR, f"{q['i']}.pkl"), "rb") as fh:
         kept = pickle.load(fh)
     tables = {name: base_of(name) for name in r["tabs"]}
+    if not dirty & r["opt"] and not dirty & r["rest"] and kept.get("plan"):
+        # no changed function runs before the steps: the tables, the tree and the plan are the pinned ones
+        from sqlglot.executor.python import PythonExecutor
+        from sqlglot.executor.table import ensure_tables
+        plan, steps = pickle.loads(kept["plan"])
+        ex = PythonExecutor(tables=ensure_tables(tables, dialect=None))
+        ex._ctes, ex._outer_scope = plan.ctes, None
+        order = list(zip(r["keys"], steps))
+        return xr_run(q, r, kept, plan, ex, order, dirty, duck_schema)
     schema, tables_ = xr_begin(shared_schema, tables)
     if dirty & r["opt"]:
         expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
@@ -2005,6 +2022,11 @@ def xr_replay(q, ranges, shared_schema, base_of, duck_schema):
         return None
     if (None if plan.ctes is None else fingerprint(plan.ctes)) != r["ctes"]:
         return None  # what subqueries inside the steps are planned with
+    return xr_run(q, r, kept, plan, ex, order, dirty, duck_schema)
+
+
+def xr_run(q, r, kept, plan, ex, order, dirty, duck_schema):
+    """The steps of xr_replay, on a plan whose steps are in the recorded order."""
     pos = {s: j for j, (_, s) in enumerate(order)}
     runs = [bool(fn & dirty) for fn in r["fn"]]  # steps that run changed code
     readers = [[] for _ in order]
