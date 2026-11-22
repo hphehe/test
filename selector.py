@@ -1004,6 +1004,11 @@ TP = os.environ.get("BR_TP", "/app/tp")  # the TPC-DS tables as the test builds 
 CHECK_JOBS = 2
 CHECK_BUDGET_S = float(os.environ.get("BR_CHECK_BUDGET", 100))  # no check starts after this many seconds of the run
 CHECK_MAX_EST_S = 14  # nor one estimated to cost more CPU seconds than this
+# Queries whose optimized tree differs are executed and their results compared. They may cost CPU in proportion to
+# the seconds that leaving test_execute_tpcds out saves (the board charges about 0.6-0.8 of a local CPU second).
+CHECK_X_PER_S = float(os.environ.get("BR_CHECK_X_PER_S", 0.9))
+CHECK_X_CAP_S = float(os.environ.get("BR_CHECK_X_CAP", 20))
+CHECK_X_INLINE_S = 0.5  # a differing query this cheap runs as soon as it is found
 
 
 # ---------------------------------------------------------------- TPC query files
@@ -1423,27 +1428,62 @@ def query_check(job, tmp):
         from sqlglot.planner import Plan  # noqa: F401
         import sqlglot.executor as sx
         # A change can make the optimizer loop: stop each phase at a few times its estimate (CPU is scored).
-        phase_limit(max(8.0, 3 * job["est"] + 2))
+        phase_limit(max(8.0, 3 * (job["est"] + job.get("xbudget", 0.0)) + 2))
         for q in job["pn"]:
             pickle.loads(pickle.dumps(parse_one(q["sql"])))
+        for q in job["d"]:  # cheap: before any query runs
+            if transpile(q["sql"], write="duckdb")[0] != q["duck"]:
+                print("duckdb sql differs", q["i"])
+                return 1
         diffs = []
         static = {q["i"] for q in job.get("xq", [])}
         extra = 0.0
+        ran = set()
+        cache = {}
+        shared_schema = None
+
+        def same_result(q):
+            # mp_execute in the test's child: the tables the query names, execute() with the shared schema, the
+            # result pickled back to the parent, which compares it with duckdb's. Same result as at the pinned
+            # commit, where the test passes -> same comparison.
+            nonlocal shared_schema
+            if shared_schema is None:
+                shared_schema = pickle.loads(pickle.dumps(job["schema"]))
+            expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
+            tables = {}
+            for t in find_tables(expression):
+                name = t.name
+                if name not in cache:
+                    with open(os.path.join(TP, name + ".pkl"), "rb") as fh:
+                        cache[name] = pickle.load(fh)
+                tables[name] = cache[name]
+            table = pickle.loads(pickle.dumps(execute(expression, schema=shared_schema, tables=tables)))
+            return result_hash(table) == q["res"]
+
         for q in job["q1"]:
             e = pickle.loads(pickle.dumps(parse_one(q["sql"])))
             schema = sx.ensure_schema(copy.deepcopy(job["schema"]), dialect=None)
             o = sx.optimize(e, schema, leave_tables_isolated=True, dialect=None)
+            o.sql(pretty=True)
             if fingerprint(o) != q["fo"]:
                 diffs.append(q)  # the executor gets another tree: execute the query and compare its result
-                extra += 0.0 if q["i"] in static else q["xcpu"]
+                if q["i"] in static:
+                    continue
+                extra += q["xcpu"]
                 if extra > job.get("xbudget", 0.0):  # it cannot be dropped any more: stop spending CPU
                     print("optimize differs", [x["i"] for x in diffs], f"executing them would cost {extra:.1f} s")
                     return 1
-            o.sql(pretty=True)
-        for q in job["d"]:
-            if transpile(q["sql"], write="duckdb")[0] != q["duck"]:
-                print("duckdb sql differs", q["i"])
-                return 1
+                if q["xcpu"] > CHECK_X_INLINE_S:
+                    continue  # runs once every tree is known and the whole set fits the budget
+                # A cheap one right away: where the test fails, a differing result usually shows early.
+                if not tables_ready():
+                    print("no tables")
+                    return 1
+                if not same_result(q):
+                    print("result differs", q["i"])
+                    return 1
+                ran.add(q["i"])
+        _log(f"check: {len(diffs)} optimized trees differ, executed {len(ran)} ({extra:.1f} s estimated)")
         for q in job.get("px", []):
             # A query the test only parses (parent) and pickles to a child that returns None for it: it passes when
             # both work. The tree may not be deeper than the pinned query's (pickling recurses).
@@ -1452,28 +1492,14 @@ def query_check(job, tmp):
             if tree_depth(a) > tree_depth(parse_one(q["old"])) + 3:
                 print("parsed query deeper", q["i"])
                 return 1
-        run = {q["i"]: q for q in job.get("xq", []) + diffs}
+        run = {q["i"]: q for q in job.get("xq", []) + diffs if q["i"] not in ran}
         if run:
-            # mp_execute in the test's child: the tables the query names, execute() with the shared schema, the
-            # result pickled back to the parent, which compares it with duckdb's. Same result as at the pinned
-            # commit, where the test passes -> same comparison.
             if not tables_ready():
                 print("no tables")
                 return 1
             phase_limit(max(5.0, 3 * sum(q["xcpu"] for q in run.values()) + 2))
-            shared_schema = pickle.loads(pickle.dumps(job["schema"]))
-            cache = {}
             for q in sorted(run.values(), key=lambda q: q["xcpu"]):
-                expression = pickle.loads(pickle.dumps(parse_one(q["sql"])))
-                tables = {}
-                for t in find_tables(expression):
-                    name = t.name
-                    if name not in cache:
-                        with open(os.path.join(TP, name + ".pkl"), "rb") as fh:
-                            cache[name] = pickle.load(fh)
-                    tables[name] = cache[name]
-                table = pickle.loads(pickle.dumps(execute(expression, schema=shared_schema, tables=tables)))
-                if result_hash(table) != q["res"]:
+                if not same_result(q):
                     print("result differs", q["i"])
                     return 1
         print("same")
@@ -5238,6 +5264,11 @@ def select_all(t_start):
                     print(f"{patch.stem}: class job: {exc!r}", file=sys.stderr)
                     job = None
             if job is not None:
+                if job.get("kind") != "cls" and tables_ready():
+                    # executing the queries whose optimized tree differs may cost in proportion to what dropping saves
+                    rest = [n for n in chosen if n != tp]
+                    gain = sim_cost(chosen, ms) - sim_cost(rest, ms)
+                    job["xbudget"] = round(max(job["xbudget"], min(CHECK_X_CAP_S, CHECK_X_PER_S * gain) - job["est"] / 2), 3)
                 jobs[patch.stem] = job
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
