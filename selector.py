@@ -1009,6 +1009,8 @@ CHECK_MAX_EST_S = 14  # nor one estimated to cost more CPU seconds than this
 CHECK_X_PER_S = float(os.environ.get("BR_CHECK_X_PER_S", 0.9))
 CHECK_X_CAP_S = float(os.environ.get("BR_CHECK_X_CAP", 20))
 CHECK_X_INLINE_S = 0.5  # a differing query this cheap runs as soon as it is found
+CHECK_EST_PER_S = float(os.environ.get("BR_CHECK_EST_PER_S", 1.5))  # estimated CPU a check may cost per second saved
+CHECK_EST_CAP_S = float(os.environ.get("BR_CHECK_EST_CAP", 36))
 
 
 # ---------------------------------------------------------------- TPC query files
@@ -1254,8 +1256,10 @@ def line_span(m, path, ln):
     return None
 
 
-def tpcds_job(m, patch_text, tp):
-    """The check that can drop test_execute_tpcds for this change, or None when it cannot apply."""
+def tpcds_job(m, patch_text, tp, max_est=None):
+    """The check that can drop test_execute_tpcds for this change, or None when it cannot apply (or would cost more
+    than max_est CPU seconds, CHECK_MAX_EST_S by default)."""
+    max_est = CHECK_MAX_EST_S if max_est is None else max_est
     tq = m.d.get("tpq")
     if not tq:
         return None
@@ -1322,17 +1326,18 @@ def tpcds_job(m, patch_text, tp):
         return None
     if e_m and not tables_ready():
         return None
+    q1 &= ~e_m  # a query that is executed is optimized there too (execute() runs the patched optimizer)
     qs = tq["q"]
     est = 1.0 + 0.05 * len(px) + sum(qs[i]["cpu"] for i in range(len(qs)) if (q1 | d_m) >> i & 1) + \
         sum(qs[i]["xcpu"] for i in range(len(qs)) if e_m >> i & 1)
-    if est > CHECK_MAX_EST_S:
+    if est > max_est:
         return None
     pick = lambda mask, keys: [{"i": i, **{k: qs[i][k] for k in keys}} for i in range(len(qs)) if mask >> i & 1]  # noqa: E731
     return {"files": files, "schema": tq["schema"], "est": est, "q1": pick(q1, ("sql", "fo", "res", "xcpu")),
             "pn": pick(pn, ("sql",)), "d": pick(d_m, ("sql", "duck")), "px": px,
             "xq": pick(e_m, ("sql", "res", "xcpu")),
             # CPU left for executing queries whose optimized tree turns out different (only known in the check)
-            "xbudget": round(CHECK_MAX_EST_S - est, 3) if tables_ready() else 0.0}
+            "xbudget": round(max_est - est, 3) if tables_ready() else 0.0}
 
 
 def tables_ready():
@@ -1408,6 +1413,36 @@ def tpcds_check():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+DUCK_MAX_TEXTS = 60
+
+
+def duck_answers_differ(dd, schema):
+    """The test compares the executor's rows with DuckDB's answer to the DuckDB text of the query. Where the patched
+    code makes another text, DuckDB answers both texts here, over the same views the test makes: the same frame
+    (columns, dtypes, values, index) means the same comparison as at the pinned commit. None when every pair agrees,
+    else why not. One thread, and the rows the test's views read loaded once (~0.8 s CPU; ~13 ms a query after)."""
+    if len(dd) > DUCK_MAX_TEXTS:
+        return f"{len(dd)} texts"
+    import duckdb
+    folder = os.path.join(ST, "tests", "fixtures", "optimizer", "tpc-ds", "")
+    conn = duckdb.connect(config={"threads": 1})
+    try:
+        for table, columns in schema.items():
+            conn.execute(f"CREATE TABLE {table} AS SELECT * FROM READ_CSV('{folder}{table}.csv.gz', delim='|', "
+                         f"header=True, columns={columns})")
+        for q, text in dd:
+            a = conn.execute(q["duck"]).fetchdf()
+            try:
+                b = conn.execute(text).fetchdf()
+            except Exception as exc:  # noqa: BLE001  (the test fails on it)
+                return f"{q['i']}: {type(exc).__name__}"
+            if list(a.columns) != list(b.columns) or not a.dtypes.equals(b.dtypes) or not a.index.equals(b.index)                     or not a.equals(b):
+                return f"{q['i']}: another answer"
+    finally:
+        conn.close()
+    return None
+
+
 def query_check(job, tmp):
     """The cheap stages of test_execute_tpcds on the tree at tmp (imported here), against the pinned outputs. With
     tmp None: on the sqlglot this process already has (the pinned tree with the commit's code put in)."""
@@ -1431,9 +1466,15 @@ def query_check(job, tmp):
         phase_limit(max(8.0, 3 * (job["est"] + job.get("xbudget", 0.0)) + 2))
         for q in job["pn"]:
             pickle.loads(pickle.dumps(parse_one(q["sql"])))
+        dd = []
         for q in job["d"]:  # cheap: before any query runs
-            if transpile(q["sql"], write="duckdb")[0] != q["duck"]:
-                print("duckdb sql differs", q["i"])
+            text = transpile(q["sql"], write="duckdb")[0]
+            if text != q["duck"]:
+                dd.append((q, text))
+        if dd:
+            why = duck_answers_differ(dd, job["schema"])
+            if why:
+                print("duckdb sql differs", why)
                 return 1
         diffs = []
         static = {q["i"] for q in job.get("xq", [])}
@@ -2542,12 +2583,6 @@ SET_PLANS = os.environ.get("BR_SET") == "1"
 _SET_PLANS = {}  # commit -> [(module, class path, name, value)]
 _MATE_FAILED = set()  # commits where a classmate of test_execute_tpcds failed in the run
 _SEEN_FAIL = {}  # commit -> tests that failed in its run
-_HOW = {}  # commit -> how its tests were decided (readout only): runner mode / "declined" / "doubt" / ...
-_KEYED = {}  # commit -> "n" narrowed by the key check, "a" kept all, "b" a module no longer imports
-_TPC = {}  # commit -> "k" the TPC-DS check kept the test, "d" dropped it, "f" its job was filtered out
-_MATES_RAN = set()  # commits whose run held a classmate of test_execute_tpcds
-_TPC_WHY = {}  # commit -> why the TPC-DS check kept the test
-_CTX = {}  # readout only: the map, the patch texts, the start time
 _TEST_SOURCES = []
 
 
@@ -3370,7 +3405,6 @@ def run_checks(jobs, t0):
         c0 = sum(os.times()[:4])
         ok, why = live_check(job, plan, _LIVE["idx"], max(20.0, 4 * (job["est"] + job.get("xbudget", 0.0))))
         _log(f"{k}: live check {ok} est {job['est']:.2f} cpu {sum(os.times()[:4]) - c0:.2f} mates_failed {k in _MATE_FAILED} {str(why)[:120]}")
-        _TPC_LIVE[k] = ("live", ok, str(why)[:300])
         if os.environ.get("BR_CHECK_AUDIT"):  # dev: the check in its own process agrees
             k2, ok2 = own_checks(jobs, t0, [k])[0]
             print(f"CHECK {'OK' if ok is None or ok == ok2 else 'MISMATCH'} {k} live {ok} own {ok2} {why}",
@@ -3378,7 +3412,6 @@ def run_checks(jobs, t0):
         if ok is None:
             continue
         if not ok:
-            _TPC_WHY[k] = str(why)
             print(f"{k}: tpcds check keeps the test (live): {why}", file=sys.stderr)
         done[k] = ok
     rest = [k for k in jobs if k not in done]
@@ -3402,9 +3435,7 @@ def own_checks(jobs, t0, keys):
             return k, False
         lines = p.stdout.strip().splitlines()
         ok = p.returncode == 0 and lines[-1:] == ["same"]
-        _TPC_LIVE[k] = ("own", ok, f"rc {p.returncode} {lines[-1:]}"[:300])
         if not ok:
-            _TPC_WHY[k] = f"rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}"
             print(f"{k}: tpcds check keeps the test: rc {p.returncode} {lines[-1:]} {p.stderr[-300:]!r}",
                   file=sys.stderr)
         return k, ok
@@ -3575,12 +3606,18 @@ HOT_BUDGET_S = float(os.environ.get("BR_HOT_BUDGET", 8.0))  # CPU seconds of tes
 FRESH_BUDGET_S = float(os.environ.get("BR_FRESH_BUDGET", 3.0))
 FRESH_IMPORT_S = 1.2  # CPU of a fresh child's import of the patched tree (the map's "run.imp" when measured)
 AFTER_FAIL = 0.5  # once a test failed, a test runs only when it costs less than this share of its recorded seconds
+# The tests a run left out after its first failure run in a second child when they would leave the answer for enough
+# seconds: they pass in about three of four such runs.
+RERUN = os.environ.get("BR_RERUN", "1") == "1"
+RERUN_PASS = 0.75
+RERUN_MIN_S = 2.0  # packed seconds those tests add to the answer, at least
 LONG_S = 15.0  # never run here: test_execute_tpcds (it has its own proof) and test_max_nodes
 TEST_WALL_S = 4.0  # wall seconds a test may take: max(this, 25 x its cost)
 SETUP_WALL_S = 12.0  # wall seconds between tests (imports, class fixtures)
 NO_RUN_FILES = ("tests/test_dialect_entry_points.py", "tests/test_sqlglotc.py")
 NO_RUN_IDS = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}  # runs python in a subprocess
 RUN_DEBUG = os.environ.get("BR_RUN_DEBUG")
+RUN_PRICE = float(os.environ.get("BR_RUN_PRICE", 1.0))  # score seconds per local CPU second of a run
 RUN_CLEAN_P = float(os.environ.get("BR_RUN_CLEAN_P", 0.5))  # weight of the all-pass gain (runs without a failure: 0.17-0.27 of runs; 0.5 keeps every sample gain)
 MATE_P = 0.6  # share of commits with test_execute_tpcds a candidate where no classmate fails (gen2k: ~0.7)
 MATE_CHEAP_S = 2.0  # classmates that run first, ahead of the budget's order
@@ -4711,7 +4748,7 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
         gain = full - sim_cost(rest, ms)
         if mates:
             gain = MATE_P * (full - sim_cost([n for n in rest if n != tp], ms)) + (1 - MATE_P) * gain
-        scored.append((gain - spend_of(r), gain, spend_of(r), r, rest))
+        scored.append((gain - RUN_PRICE * spend_of(r), gain, spend_of(r), r, rest))
     scored.sort(key=lambda x: -x[0])
     # Most commits fail some candidate, and a failing test stays with its worker: expect the all-pass gain only with
     # RUN_CLEAN_P, else the gain left when one test that runs fails (averaged over up to 16 of them). The all-pass
@@ -4724,7 +4761,7 @@ def run_choice(m, plan, cands, tests, ms, info, tp=None, mates_all=0, red=None):
         if len(fs) > 16:
             fs = [fs[i * (len(fs) - 1) // 15] for i in range(16)]
         one = sum(full - sim_cost(rest + [f], ms) for f in fs) / len(fs)
-        net = RUN_CLEAN_P * gain + (1 - RUN_CLEAN_P) * max(0.0, one) - spend
+        net = RUN_CLEAN_P * gain + (1 - RUN_CLEAN_P) * max(0.0, one) - RUN_PRICE * spend
         if net > 0 and (best is None or net > best[0]):
             best = (net, r, spend)
     if best is None:
@@ -4903,7 +4940,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         if ch is not None:
             jobs.append([c, cands, plan, ch, red])
         else:
-            _HOW[c] = "noplan" if not plan else "declined"
             _log(c, "no run:", "no plan" if not plan else f"{plan['mode']} {len(cands)} candidates")
     if not jobs:
         return {}, set()
@@ -4960,9 +4996,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
         elif j[4] and not filtered:
             j[4] = {}
             j[3] = run_choice(m, plan, j[1], tests, ms, info, tp, mates_all)
-    for j in jobs:
-        if j[3] is None:
-            _HOW[j[0]] = "declined"
     jobs = [j for j in jobs if j[3] is not None]
     idx = function_index()
     t_imm = time.process_time()
@@ -4977,7 +5010,6 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
     for c, cands, plan, (run, skip_after, allowed, cap, spend, mates), red in jobs:
         left = t_start + RUN_DEADLINE_S - time.monotonic()
         if left < 5.0:
-            _HOW.setdefault(c, "late")
             break
         try:
             exp_mask = expected_callers(m, plan) if plan["mode"] == "hot" else 0
@@ -5020,15 +5052,10 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
                               file=sys.stderr, flush=True)
         except Exception as exc:  # noqa: BLE001
             _log(c, "run:", repr(exc))
-            _HOW[c] = "error"
             continue
         if doubt:
             _log(c, plan["mode"], "doubt:", doubt)
-            _HOW[c] = "doubt"
             continue
-        _HOW[c] = "warm" if plan["mode"] == "fresh" and plan.get("group") else plan["mode"]
-        if mates_all and any(mates_all >> n & 1 for n in verdicts):
-            _MATES_RAN.add(c)
         passed = {n for n, (code, reached, _) in verdicts.items()
                   if code == 0 and (reached or not exp_mask >> n & 1)}
         out[c] = passed
@@ -5047,7 +5074,55 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
              f"{sum(1 for n in run if n in red)} pass {len(passed)} "
              f"fail {sum(1 for v in verdicts.values() if v[0] == 1)} status {status} est {spend:.2f} cpu {used:.2f}"
              + (f" mates {len(mates)} {'drop tpcds' if c in tp_ok else 'keep tpcds'}" if mates else ""))
+        if RERUN and status == "END" and failing:
+            try:
+                rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, idx, t_start, tp, tp_ok,
+                              exp_mask)
+            except Exception as exc:  # noqa: BLE001
+                _log(c, "rerun:", repr(exc))
     return out, tp_ok
+
+
+def rerun_skipped(c, cands, plan, run, verdicts, passed, red, tests, ms, info, idx, t_start, tp, tp_ok, exp_mask):
+    """A second child for the tests that the run of commit c left out after its first failure, when leaving out the
+    ones that pass is expected to save more than the run costs. Adds to passed (and to _SEEN_FAIL) in place."""
+    cpu = info.get("cpu", {})
+
+    def cost(n):
+        x = cpu.get(tests[n]["id"])
+        x = x if x is not None else 1.5 * ms[n] / 1000 + 0.01
+        return x * red[n]["frac"] if red and n in red else x
+    skipped = [n for n in run if n not in verdicts and n != tp]
+    if not skipped:
+        return
+    answer = [n for n in cands if n not in passed and not (n == tp and c in tp_ok)]
+    full = sim_cost(answer, ms)
+    # the cheapest seconds first, as long as each adds to the saving
+    order = sorted(skipped, key=lambda n: -(ms[n] / 1000 + 0.002) / (cost(n) + 0.002))
+    pick, spend, best = [], 0.02 if plan["mode"] == "hot" else info.get("imp", FRESH_IMPORT_S), None
+    for n in order:
+        pick.append(n)
+        spend += cost(n)
+        gain = full - sim_cost([x for x in answer if x not in pick], ms)
+        net = RERUN_PASS * gain - RUN_PRICE * spend
+        if gain >= RERUN_MIN_S and net > 0 and (best is None or net > best[0]):
+            best = (net, list(pick), spend, gain)
+    if best is None:
+        return
+    left = t_start + RUN_DEADLINE_S - time.monotonic()
+    if left < 5.0:
+        return
+    _, todo, spend, gain = best
+    allowed = {n: max(TEST_WALL_S, 25 * cost(n)) for n in todo}
+    v, status, doubt = fork_run(plan, todo, tests, idx, set(), allowed, 2.0 + 3.0 * spend + max(allowed.values()),
+                                left - 2.0, red)
+    if doubt:
+        return
+    ok = {n for n, (code, reached, _) in v.items() if code == 0 and (reached or not exp_mask >> n & 1)}
+    passed.update(ok)
+    _SEEN_FAIL.setdefault(c, set()).update(n for n, x in v.items() if x[0] == 1)
+    _log(f"{c} rerun {len(v)}/{len(todo)} of {len(skipped)} skipped: pass {len(ok)}, status {status}, "
+         f"est {spend:.2f} s, gain if all pass {gain:.2f} s")
 
 
 def measure_main(out_path):
@@ -5147,16 +5222,12 @@ def main():
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     if not order:
         order = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
-    answers = {}
+    lines = []
     for stem in order:
         chosen = out.get(stem)
-        answers[stem] = pack(list(ms) if chosen is None else chosen, ms)
-    if READOUT:
-        try:
-            readout(answers, ms, tests)
-        except Exception as exc:  # noqa: BLE001
-            print(f"readout: {exc!r}", file=sys.stderr)
-    lines = [json.dumps({"commit": stem, "workers": answers[stem]}) for stem in order]
+        if chosen is None:
+            chosen = list(ms)
+        lines.append(json.dumps({"commit": stem, "workers": pack(chosen, ms)}))
     data = ("\n".join(lines) + "\n").encode() if lines else b""
     while data:
         data = data[os.write(ans_fd, data):]
@@ -5169,218 +5240,6 @@ def main():
     print(f"done: {time.monotonic() - t_start:.1f} s wall, {sum(os.times()[:4]):.2f} s CPU {cg}", file=sys.stderr)
     sys.stderr.flush()
     os._exit(0)  # no interpreter teardown (it only costs CPU)
-
-
-# Measurement build only (None in every scored entry): one commit whose answer is empty gets a single worker of tests
-# whose recorded milliseconds add up to a number about this batch, so the simulated total tells it.
-READOUT = True
-
-
-_HOW_CODE = {"hot": 0, "warm": 1, "fresh": 2, "declined": 3}
-_TPC_LIVE = {}  # probe: commit -> (where, ok, why)
-_TPC_JOB = {}  # probe: commit -> the check job's shape
-
-
-def truth_run(c, tp, mates, tests, ms):
-    """Readout only: the verdicts of the classmates and of test_execute_tpcds when they really run on the patched
-    tree (a fresh import in a forked child): (tpcds code, {classmate: code}, status)."""
-    m, text, t0 = _CTX["m"], _CTX["texts"][c], _CTX["t0"]
-    if "idx" not in _LIVE or time.monotonic() - t0 > 110:
-        return None, {}, "skip"
-    plan = run_plan(m, text)
-    if not plan:
-        return None, {}, "noplan"
-    plan = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
-    tmap = {t["number"]: t for t in tests}
-    order = [n for n in sorted(mates) if tmap[n]["id"].count("::") == 2 and tmap[n]["id"] not in NO_RUN_IDS
-             and not tmap[n]["id"].startswith(NO_RUN_FILES)] + [tp]
-    allowed = {n: (150.0 if n == tp else 30.0) for n in order}
-    v, status, doubt = fork_run(plan, order, tmap, _LIVE["idx"], set(), allowed, None,
-                                max(10.0, 170.0 - (time.monotonic() - t0)))
-    return (v[tp][0] if tp in v else None), {n: x[0] for n, x in v.items() if n != tp}, (doubt and "doubt") or status
-
-
-_WHY_CODES = (("optimize differs", 3), ("duckdb sql differs", 4), ("result differs", 5), ("recursionerror", 6),
-              ("timed out", 9), ("parsed query deeper", 11), ("no tables", 12), ("doubt", 8), ("error", 7))
-
-
-def why_code(c):
-    """4 bits: how the TPC-DS check ended for commit c."""
-    if _TPC.get(c) is None:
-        return 0  # no check job at all
-    r = _TPC_LIVE.get(c)
-    if r is None:
-        return 1  # a job, but no check ran (filtered or over the budget)
-    where, ok, why = r
-    if ok:
-        return 2
-    w = why.lower()
-    if where == "live" and ok is None:
-        return 8
-    for key, code in _WHY_CODES:
-        if key in w:
-            return code
-    return 10 if where == "own" else 13
-
-
-def return_index(fn_name, line):
-    """Index of the return statement at this line among the returns of the selector function fn_name (source
-    order; 0 = the function ended without one)."""
-    import ast as _ast
-    src = open(os.path.abspath(__file__).replace(".pyc", ".py"), encoding="utf-8").read()
-    for n in _ast.walk(_ast.parse(src)):
-        if isinstance(n, _ast.FunctionDef) and n.name == fn_name:
-            lines = sorted({r.lineno for r in _ast.walk(n) if isinstance(r, _ast.Return)})
-            return lines.index(line) + 1 if line in lines else 0
-    return 0
-
-
-def job_reasons(m, text, tp, gain):
-    """Probe 33: which return each job builder took for this commit: (tpcds_job 5 bits, changed_bodies 3 bits
-    (its last call), cls_job 4 bits; 15 = not called)."""
-    last = {}
-
-    def tr(frame, ev, arg):
-        name = frame.f_code.co_name
-        if name in ("tpcds_job", "changed_bodies", "cls_job"):
-            if ev == "return":
-                last[name] = frame.f_lineno
-            return tr
-        return None
-    sys.settrace(tr)
-    try:
-        job = tpcds_job(m, text, tp)
-    except Exception:  # noqa: BLE001
-        job = "x"
-    finally:
-        sys.settrace(None)
-    tj = return_index("tpcds_job", last.get("tpcds_job", -1)) if job is None else (30 if job == "x" else 31)
-    cb = min(return_index("changed_bodies", last["changed_bodies"]), 7) if "changed_bodies" in last else 0
-    cl = 15
-    if job is None and gain >= SNAP_EST_S + 2:
-        last.pop("cls_job", None)
-        sys.settrace(tr)
-        try:
-            cj = cls_job(m, text, tp)
-        except Exception:  # noqa: BLE001
-            cj = "x"
-        finally:
-            sys.settrace(None)
-        cl = (min(return_index("cls_job", last.get("cls_job", -1)), 13) if cj is None else
-              (14 if cj == "x" else (12 if cj["est"] + 2 > gain else 11)))
-    print(f"readout: job reasons tj {tj} (line {last.get('tpcds_job')}) cb {cb} (line {last.get('changed_bodies')}) "
-          f"cls {cl} (line {last.get('cls_job')})", file=sys.stderr)
-    return min(tj, 31), cb, cl
-
-
-def readout_value(answers, ms, tests):
-    """Probe 33. V = reasons << 4 | payload << 2 | m (16 bits). reasons (every run): for the .py commit that keeps
-    test_execute_tpcds without a failure seen, the return each job builder took (job_reasons: tpcds_job 5 bits,
-    changed_bodies 3 bits, cls_job 4 bits). payload (2 bits: < 1.5 s, < 4.5 s, < 7.5 s, more) by m drawn per run: the simulated
-    seconds that leaving out the unrun tests that really pass would save, m0 within 6 s of their run CPU (commits
-    by saving per CPU second), m1 on commits whose runs were declined here, m2 on commits that ran here."""
-    def cost(ws):
-        ws = [w for w in ws if w]
-        return (max(sum(ms[t] for t in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
-    tp = next((t["number"] for t in tests if t["id"] == TPCDS_ID), None)
-    tmap = {t["number"]: t for t in tests}
-    m, t0 = _CTX["m"], _CTX["t0"]
-    one = None
-    for c in sorted(answers):
-        chosen = [t for w in answers[c] for t in w]
-        if tp in chosen and tp not in _SEEN_FAIL.get(c, set()):
-            files = set()
-            for old, new, _ in parse_patch(_CTX["texts"][c]):
-                files.update(x for x in (old, new) if x)
-            if all(f.startswith("sqlglot/") and f.endswith(".py") for f in files):
-                one = c
-                break
-    if one is None:
-        reasons = 4095
-    else:
-        chosen = [t for w in answers[one] for t in w]
-        gain = (cost(answers[one]) - cost(pack([t for t in chosen if t != tp], ms))) / 1000
-        try:
-            tj, cb, cl = job_reasons(m, _CTX["texts"][one], tp, gain)
-        except Exception as exc:  # noqa: BLE001
-            print(f"readout: job reasons {exc!r}", file=sys.stderr)
-            tj, cb, cl = 29, 0, 14
-        reasons = tj << 7 | cb << 4 | cl
-    mm = int.from_bytes(os.urandom(1), "little") % 3
-    todo = []
-    for c, ws in answers.items():
-        chosen = [t for w in ws for t in w]
-        seen = _SEEN_FAIL.get(c, set())
-        unv = [t for t in chosen if t not in seen and t != tp]
-        if unv:
-            todo.append((-sum(ms[t] for t in unv), c, unv))
-    todo.sort()
-    rows = []
-    for _, c, unv in todo:
-        if "idx" not in _LIVE or time.monotonic() - t0 > 150:
-            break
-        try:
-            plan = run_plan(m, _CTX["texts"][c])
-        except Exception:  # noqa: BLE001
-            plan = None
-        if not plan:
-            continue
-        plan = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
-        order = [n for n in unv if tmap[n]["id"].count("::") == 2 and tmap[n]["id"] not in NO_RUN_IDS
-                 and not tmap[n]["id"].startswith(NO_RUN_FILES)]
-        if not order:
-            continue
-        c0 = sum(os.times()[:4])
-        try:
-            v, status, doubt = fork_run(plan, order, tmap, _LIVE["idx"], set(), {n: 30.0 for n in order}, None,
-                                        max(5.0, 165.0 - (time.monotonic() - t0)))
-        except Exception as exc:  # noqa: BLE001
-            print(f"readout: truth run {c}: {exc!r}", file=sys.stderr)
-            continue
-        cpu = sum(os.times()[:4]) - c0
-        ok = {n for n, x in v.items() if x[0] == 0}
-        chosen = [t for w in answers[c] for t in w]
-        gain = cost(answers[c]) - cost(pack([t for t in chosen if t not in ok], ms))
-        rows.append((gain, cpu, _HOW.get(c)))
-        print(f"readout {c}: unverified {len(unv)} ({sum(ms[t] for t in unv)} ms), pass {len(ok)} "
-              f"({sum(ms[n] for n in ok)} ms), saving {gain} ms, cpu {cpu:.2f}, how {_HOW.get(c)}", file=sys.stderr)
-    declined = sum(g for g, _, h in rows if h not in ("hot", "warm", "fresh"))
-    ran = sum(g for g, _, h in rows if h in ("hot", "warm", "fresh"))
-    front, spent = 0, 0.0
-    for g, cpu, _ in sorted(rows, key=lambda r: -r[0] / max(r[1], 0.05)):
-        if g <= 0 or spent + cpu > 6.0:
-            continue
-        spent += cpu
-        front += g
-    x = (front, declined, ran)[mm]
-    payload = 0 if x < 1500 else 1 if x < 4500 else 2 if x < 7500 else 3
-    print(f"readout: reasons {reasons} front {front} ({spent:.1f} s cpu) declined {declined} ran {ran} m {mm} "
-          f"payload {payload}", file=sys.stderr)
-    return reasons << 4 | payload << 2 | mm
-
-
-def readout(answers, ms, tests):
-    value = readout_value(answers, ms, tests)
-    target = 50 + value  # milliseconds on one added worker
-    stem = next((c for c in sorted(answers) if not any(answers[c])), None)
-    if stem is None:
-        print("readout: no empty answer", file=sys.stderr)
-        return
-    nums = sorted(n for n in ms if ms[n] > 0)
-    reach = [1]  # reach[i] has bit s set when some of nums[:i] add up to s ms
-    lim = (1 << (target + 1)) - 1
-    for n in nums:
-        reach.append((reach[-1] | reach[-1] << ms[n]) & lim)
-    if not reach[-1] >> target & 1:
-        print(f"readout: {target} ms cannot be made", file=sys.stderr)
-        return
-    picked, left = [], target
-    for i in range(len(nums) - 1, -1, -1):
-        if left and not reach[i] >> left & 1:
-            picked.append(nums[i])
-            left -= ms[nums[i]]
-    answers[stem] = [sorted(picked)]
-    print(f"readout value {value} target {target} ms on {stem}", file=sys.stderr)
 
 
 def key_phase(m, tests, ms, rows, out):
@@ -5432,10 +5291,8 @@ def key_phase(m, tests, ms, rows, out):
     res.update(run_key_checks(fresh, t0))
     for stem, r in res.items():
         if not r or "why" in r:
-            _KEYED[stem] = "a"
             print(f"{stem}: key check keeps all: {r and r.get('why')}", file=sys.stderr)
             continue
-        _KEYED[stem] = "a"
         keep = key_readers(m, r["diffs"], r["by_key"], r.get("shadow"), jobs[stem].get("renames"))
         if isinstance(keep, str):
             print(f"{stem}: key check keeps all: {keep}", file=sys.stderr)
@@ -5447,9 +5304,7 @@ def key_phase(m, tests, ms, rows, out):
                 keep.update(n for n in out[stem] if mask >> n & 1)
         before = len(out[stem])
         out[stem] = [n for n in out[stem] if n in keep]
-        _KEYED[stem] = "n"
         if any(d[0].startswith("IMPORTERROR") for d in r["diffs"]):
-            _KEYED[stem] = "b"
             no_run.add(stem)
         elif r["diffs"] and SET_PLANS:
             try:
@@ -5488,7 +5343,8 @@ def select_all(t_start):
         rows.append((patch.stem, chosen, text))
         if tp is not None and mask >> tp & 1:
             try:
-                job = tpcds_job(m, text, tp)
+                # (up to the cap here; the seconds that leaving the test out saves are known after the runs)
+                job = tpcds_job(m, text, tp, CHECK_EST_CAP_S)
             except Exception as exc:  # noqa: BLE001  (no check: keep the test)
                 print(f"{patch.stem}: tpcds job: {exc!r}", file=sys.stderr)
                 job = None
@@ -5504,13 +5360,7 @@ def select_all(t_start):
                     print(f"{patch.stem}: class job: {exc!r}", file=sys.stderr)
                     job = None
             if job is not None:
-                if job.get("kind") != "cls" and tables_ready():
-                    # executing the queries whose optimized tree differs may cost in proportion to what dropping saves
-                    rest = [n for n in chosen if n != tp]
-                    gain = sim_cost(chosen, ms) - sim_cost(rest, ms)
-                    job["xbudget"] = round(max(job["xbudget"], min(CHECK_X_CAP_S, CHECK_X_PER_S * gain) - job["est"] / 2), 3)
                 jobs[patch.stem] = job
-    _CTX.update(m=m, texts={stem: text for stem, _, text in rows}, t0=t_start)
     _log(f"phase select: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} check jobs")
     out = {stem: chosen for stem, chosen, _ in rows}
     no_run = set()
@@ -5528,16 +5378,25 @@ def select_all(t_start):
         passed, tp_ok = {}, set()
     _log(f"phase runs: {sum(os.times()[:4]):.2f} s CPU, test_execute_tpcds left out by its classmates in {len(tp_ok)}")
     for stem, ok in passed.items():
-        out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
+        out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok
+                                                                and not os.environ.get("BR_NO_TP_OK"))]
     # The proof checks first, wherever the runs left test_execute_tpcds in without seeing it fail, also where a
     # classmate failed: on the board a commit fails a classmate while test_execute_tpcds passes.
-    for k in jobs:
-        _TPC[k] = "f"
-        j = jobs[k]
-        _TPC_JOB[k] = (j.get("kind") == "cls", j.get("est", 0.0), len(j.get("q1", ())), len(j.get("d", ())),
-                       len(j.get("xq", ())), len(j.get("px", ())) + len(j.get("pn", ())))
     jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run
             and tp not in _SEEN_FAIL.get(k, ())}
+    for k in list(jobs):
+        job = jobs[k]
+        if job.get("kind") == "cls":
+            continue
+        gain = sim_cost(out[k], ms) - sim_cost([n for n in out[k] if n != tp], ms)
+        # A check may cost about what leaving the test out saves now (the board charges ~0.6-0.8 of a local CPU
+        # second; a check costs ~0.7 of its estimate). Queries whose optimized tree differs may then be executed.
+        allowed = max(CHECK_MAX_EST_S, min(CHECK_EST_CAP_S, CHECK_EST_PER_S * gain))
+        if job["est"] > allowed:
+            del jobs[k]
+            continue
+        if tables_ready():
+            job["xbudget"] = round(max(allowed - job["est"], min(CHECK_X_CAP_S, CHECK_X_PER_S * gain) - job["est"] / 2), 3)
     try:
         dropped = run_checks(jobs, time.time())
     except Exception as exc:  # noqa: BLE001
@@ -5545,7 +5404,6 @@ def select_all(t_start):
         dropped = {}
     _log(f"phase checks: {sum(os.times()[:4]):.2f} s CPU, {len(jobs)} checks")
     for stem, ok in dropped.items():
-        _TPC[stem] = "d" if ok else "k"
         if ok:
             out[stem] = [n for n in out[stem] if n != tp]
     # The classmate runs only where no check ran.
@@ -5561,73 +5419,6 @@ def select_all(t_start):
                 out[stem] = [n for n in out[stem] if n != tp]
         _log(f"phase classmates: {sum(os.times()[:4]):.2f} s CPU, {sum(mres.values())} of {len(mres)} leave")
     return [stem for stem, _, _ in rows], out
-
-
-def mates_eval_main(args):
-    """Dev only: for every labelled commit that selects test_execute_tpcds, run all its runnable classmates on the
-    patched tree (fresh import, forked child) and print their verdicts and CPU with the known tpcds outcome.
-    args: SET_DIR (commits/, tests.json, answers.json or tpcds.jsonl) [ONLY ids...]"""
-    import gc
-    set_dir, only = args[0], set(args[1:])
-    m = Map(MAP)
-    tl = json.load(open(os.path.join(set_dir, "tests.json")))["tests"]
-    tests = {t["number"]: t for t in tl}
-    ms = {n: round(t["seconds"] * 1000) for n, t in tests.items()}
-    tp = next(n for n, t in tests.items() if t["id"] == TPCDS_ID)
-    labels = {}
-    if os.path.isfile(os.path.join(set_dir, "answers.json")):
-        for c, a in json.load(open(os.path.join(set_dir, "answers.json")))["commits"].items():
-            labels[c] = tp in a["failing"]
-    else:
-        for x in open(os.path.join(set_dir, "tpcds.jsonl")):
-            r = json.loads(x)
-            if r.get("ran"):
-                labels[r["id"]] = bool(r["failing"])
-    mates_all = tpcds_mates(m, tests, ms, tp)
-    mates = [n for n in sorted(tests) if mates_all >> n & 1 and tests[n]["id"].count("::") == 2
-             and tests[n]["id"] not in NO_RUN_IDS and not tests[n]["id"].startswith(NO_RUN_FILES)]
-    jobs = []
-    for c in sorted(labels):
-        if only and c not in only:
-            continue
-        try:
-            text = open(os.path.join(set_dir, "commits", c + ".patch"), encoding="utf-8", errors="replace").read()
-            mask = select(m, text)
-        except Exception as exc:  # noqa: BLE001
-            print(json.dumps({"c": c, "skip": repr(exc)}), flush=True)
-            continue
-        if not mask >> tp & 1:
-            continue
-        files = set()
-        for old, new, _ in parse_patch(text):
-            files.update(x for x in (old, new) if x)
-        plan = run_plan(m, text)
-        jobs.append((c, plan, sorted(files)))
-    print(json.dumps({"jobs": len(jobs), "mates": len(mates)}), flush=True)
-    for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
-        os.environ.setdefault(k, "1")
-    os.chdir(ST)
-    sys.path.insert(0, ST)
-    use_local_pool()
-    for name in sorted({tests[n]["id"].split("::")[0][:-3].replace("/", ".") for n in mates}):
-        try:
-            __import__(name)
-        except BaseException as exc:  # noqa: BLE001
-            print(json.dumps({"import": name, "err": repr(exc)[:100]}), flush=True)
-    idx = function_index()
-    make_immortal()
-    gc.freeze()
-    for c, plan, files in jobs:
-        row = {"c": c, "tp_fail": labels[c], "files": files, "mode": plan and plan["mode"]}
-        if not plan:
-            print(json.dumps(dict(row, skip="no plan")), flush=True)
-            continue
-        fp = dict(plan, mode="fresh", pairs=[], group=None, sets=None)
-        t0 = time.monotonic()
-        v, status, doubt = fork_run(fp, mates, tests, idx, set(), {n: 30.0 for n in mates}, None, 400.0)
-        row.update(status=status, doubt=doubt, wall=round(time.monotonic() - t0, 2),
-                   v={str(n): [x[0], round(x[2], 4)] for n, x in v.items()})
-        print(json.dumps(row), flush=True)
 
 
 if __name__ == "__main__":
@@ -5647,8 +5438,6 @@ if __name__ == "__main__":
         sys.exit(key_snap_main(sys.argv[2:4]))
     elif sys.argv[1:2] == ["--snap"]:
         sys.exit(snap_main(sys.argv[2:6]))
-    elif sys.argv[1:2] == ["--mates-eval"]:
-        mates_eval_main(sys.argv[2:])
     elif sys.argv[1:2] == ["--measure"]:
         measure_main(sys.argv[2])
     else:
