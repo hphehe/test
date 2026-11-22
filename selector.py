@@ -2234,6 +2234,7 @@ def key_job(m, text):
 # namespace, its child also hands back those values. A forked run child can then set them on the objects the runner
 # parent imported instead of importing the patched tree again (a hot plan without code pairs).
 _SET_PLANS = {}  # commit -> [(module, class path, name, value)]
+_MATE_FAILED = set()  # commits where a classmate of test_execute_tpcds failed in the run
 _TEST_SOURCES = []
 
 
@@ -4487,6 +4488,8 @@ def runner_phase(m, tests, ms, work, t_start, tp=None, checks=()):
                   if code == 0 and (reached or not exp_mask >> n & 1)}
         out[c] = passed
         failing = [n for n, v in verdicts.items() if v[0] == 1]
+        if any(mates_all >> n & 1 for n in failing):
+            _MATE_FAILED.add(c)
         # test_execute_tpcds stays when a classmate that ran fails, when a classmate's pass is not trusted (a hot
         # run that never reached the changed code it was expected to reach), or when many tests fail. On 106
         # labelled commits that select it, every one of the 13 where it fails also fails a cheap classmate.
@@ -4755,7 +4758,9 @@ def select_all(t_start):
     for stem, ok in passed.items():
         out[stem] = [n for n in out[stem] if n not in ok and not (n == tp and stem in tp_ok)]
     # The proof checks only where the runs left test_execute_tpcds in
-    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run}
+    # ... and where no classmate failed here: on 369 labelled commits, every one with a failing classmate also
+    # fails test_execute_tpcds (7 of 7), so a check there would only confirm it.
+    jobs = {k: v for k, v in jobs.items() if tp in out.get(k, ()) and k not in no_run and k not in _MATE_FAILED}
     try:
         dropped = run_checks(jobs, time.time())
     except Exception as exc:  # noqa: BLE001
